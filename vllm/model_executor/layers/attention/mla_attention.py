@@ -252,6 +252,7 @@ from vllm.v1.attention.backends.utils import (
     split_decodes_and_prefills,
 )
 from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
+from vllm.v1.attention.ops.helix import helix_alltoall_lse_reduce
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 from vllm.v1.attention.selector import get_attn_backend
 from vllm.v1.kv_cache_interface import (
@@ -1758,6 +1759,9 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
         self.cp_kv_cache_interleave_size: int = (
             get_current_vllm_config().parallel_config.cp_kv_cache_interleave_size
         )
+        self.helix_mode: bool = (
+            get_current_vllm_config().parallel_config.helix_mode
+        )
         self._decode_concat_quant_fp8_op = _DecodeConcatQuantFP8(
             static=True,
             group_shape=GroupShape.PER_TENSOR,
@@ -2438,12 +2442,22 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
 
             # correct dcp attn_out with lse.
             if self.dcp_world_size > 1:
-                attn_out = cp_lse_ag_out_rs(
-                    attn_out,
-                    lse,
-                    get_dcp_group(),
-                    is_lse_base_on_e=not getattr(self, "_use_fi_prefill", False),
-                )
+                if self.helix_mode:
+                    # Helix: Use All-to-All + LSE reduction
+                    from vllm.distributed.parallel_state import get_helix_kvp_group
+                    attn_out = helix_alltoall_lse_reduce(
+                        attn_out,
+                        lse,
+                        get_helix_kvp_group(),
+                    )
+                else:
+                    # Standard DCP: AllGather + ReduceScatter
+                    attn_out = cp_lse_ag_out_rs(
+                        attn_out,
+                        lse,
+                        get_dcp_group(),
+                        is_lse_base_on_e=not getattr(self, "_use_fi_prefill", False),
+                    )
 
             # v_up projection
             self._v_up_proj(attn_out, out=output[:num_decode_tokens])
