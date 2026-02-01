@@ -258,6 +258,7 @@ class BatchDCPPrefillWrapper:
                 lse_context_tmp,
                 get_helix_kvp_group(),
                 return_lse=True,
+                is_lse_base_on_e=False,  # FlashInfer uses log2, not ln
             )
         else:
             # Standard DCP or Helix MLA: AllGather Q, then compute
@@ -280,6 +281,7 @@ class BatchDCPPrefillWrapper:
                     lse_context_tmp,
                     get_helix_kvp_group(),
                     return_lse=True,
+                    is_lse_base_on_e=False,  # FlashInfer uses log2, not ln
                 )
             else:
                 # Standard DCP: AllGather + ReduceScatter
@@ -1581,6 +1583,7 @@ class FlashInferImpl(AttentionImpl):
                             output_tmp,
                             lse,
                             get_helix_kvp_group(),
+                            is_lse_base_on_e=False,  # FlashInfer uses log2, not ln
                         )
                     else:
                         # Standard DCP or Helix MLA: AllGather Q
@@ -1609,6 +1612,7 @@ class FlashInferImpl(AttentionImpl):
                                 output_tmp,
                                 lse,
                                 get_helix_kvp_group(),
+                                is_lse_base_on_e=False,  # FlashInfer uses log2, not ln
                             )
                         else:
                             # Standard DCP: AllGather + ReduceScatter
