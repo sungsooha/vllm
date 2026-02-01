@@ -1568,7 +1568,7 @@ class FlashInferImpl(AttentionImpl):
                             device=decode_query.device,
                         )
                         decode_wrapper.run(
-                            decode_query,
+                            decode_query.contiguous(),
                             kv_cache_permute,
                             k_scale=layer._k_scale_float,
                             v_scale=layer._v_scale_float,
