@@ -102,6 +102,9 @@ g_fi_workspace = torch.zeros(
 
 
 class FlashInferMLAImpl(MLACommonImpl[MLACommonMetadata]):
+    # Enable LSE return for DCP/Helix support (requires FlashInfer PR #2332)
+    can_return_lse_for_decode: bool = True
+
     def __init__(
         self,
         num_heads: int,
@@ -180,7 +183,7 @@ class FlashInferMLAImpl(MLACommonImpl[MLACommonMetadata]):
         if self.bmm2_scale is None:
             self.bmm2_scale = layer._v_scale_float
 
-        o = trtllm_batch_decode_with_kv_cache_mla(
+        o, lse = trtllm_batch_decode_with_kv_cache_mla(
             query=q,
             kv_cache=kv_c_and_k_pe_cache.unsqueeze(1),
             workspace_buffer=self._workspace_buffer,
@@ -192,11 +195,14 @@ class FlashInferMLAImpl(MLACommonImpl[MLACommonMetadata]):
             max_seq_len=attn_metadata.max_seq_len,
             bmm1_scale=self.bmm1_scale,
             bmm2_scale=self.bmm2_scale,
+            return_lse=self.need_to_return_lse_for_decode,
         )
 
         # Flatten the output for consistent shape
         o = o.view(-1, o.shape[-2], o.shape[-1])
 
-        # TODO: Return LSE pending support from Flashinfer API:
-        # https://github.com/flashinfer-ai/flashinfer/pull/1566
+        # Return LSE for DCP/Helix (requires FlashInfer PR #2332)
+        if self.need_to_return_lse_for_decode:
+            # LSE shape from FlashInfer: [B, num_qo_heads]
+            return o, lse
         return o, None
