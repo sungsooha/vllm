@@ -183,7 +183,7 @@ class FlashInferMLAImpl(MLACommonImpl[MLACommonMetadata]):
         if self.bmm2_scale is None:
             self.bmm2_scale = layer._v_scale_float
 
-        o, lse = trtllm_batch_decode_with_kv_cache_mla(
+        result = trtllm_batch_decode_with_kv_cache_mla(
             query=q,
             kv_cache=kv_c_and_k_pe_cache.unsqueeze(1),
             workspace_buffer=self._workspace_buffer,
@@ -198,11 +198,16 @@ class FlashInferMLAImpl(MLACommonImpl[MLACommonMetadata]):
             return_lse=self.need_to_return_lse_for_decode,
         )
 
-        # Flatten the output for consistent shape
-        o = o.view(-1, o.shape[-2], o.shape[-1])
-
-        # Return LSE for DCP/Helix (requires FlashInfer PR #2332)
+        # Handle return value based on whether LSE was requested
+        # (matches pattern in flashattn_mla.py)
         if self.need_to_return_lse_for_decode:
+            o, lse = result
+            # Flatten the output for consistent shape
+            o = o.view(-1, o.shape[-2], o.shape[-1])
             # LSE shape from FlashInfer: [B, num_qo_heads]
             return o, lse
-        return o, None
+        else:
+            o = result
+            # Flatten the output for consistent shape
+            o = o.view(-1, o.shape[-2], o.shape[-1])
+            return o, None
