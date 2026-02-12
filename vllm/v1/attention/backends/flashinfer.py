@@ -269,6 +269,7 @@ class BatchDCPPrefillWrapper:
                 lse_context_tmp,
                 get_helix_kvp_group(),
                 return_lse=True,
+                is_lse_base_on_e=False,
             )
         else:
             # Standard DCP: AllGather + ReduceScatter
@@ -1567,6 +1568,7 @@ class FlashInferImpl(AttentionImpl):
                             output_tmp,
                             lse,
                             get_helix_kvp_group(),
+                            is_lse_base_on_e=False,
                         )
                     else:
                         # Standard DCP: AllGather + ReduceScatter
