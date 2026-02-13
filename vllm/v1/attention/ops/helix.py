@@ -12,6 +12,8 @@ Reference: https://arxiv.org/abs/2507.07120
 
 from __future__ import annotations
 
+import logging
+from collections import OrderedDict
 from typing import TYPE_CHECKING
 
 import torch
@@ -19,8 +21,22 @@ import torch.distributed as dist
 
 from vllm.triton_utils import tl, triton
 
+logger = logging.getLogger(__name__)
+
 if TYPE_CHECKING:
     from vllm.distributed.parallel_state import GroupCoordinator
+
+# ============================================================================
+# Packed A2A Buffer Cache
+# ============================================================================
+# Helix uses a single packed A2A call per layer, fusing output and LSE into
+# one tensor. Send/recv buffers are cached by shape to avoid per-call
+# allocation. In vLLM continuous batching, B (decode token count) varies
+# per step, but the scheduler stabilizes B at a few values during steady
+# state. The cache typically holds 2-3 entries. Capped at _A2A_CACHE_LIMIT
+# entries to bound GPU memory; oldest entries evicted on overflow.
+_A2A_CACHE_LIMIT = 8
+_a2a_buffers: OrderedDict[tuple, tuple[torch.Tensor, torch.Tensor]] = OrderedDict()
 
 
 def _lse_weighted_combine(
@@ -291,23 +307,28 @@ def helix_alltoall_lse_reduce(
     is_lse_base_on_e: bool = True,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
-    Perform Helix-style attention output combination using All-to-All.
+    Perform Helix-style attention output combination using packed All-to-All.
 
-    In DCP (Decode Context Parallel), each rank computes partial attention
-    with its local KV cache shard. This function uses All-to-All communication
-    to exchange partial outputs and combines them using LSE-weighted averaging.
+    Uses a single packed A2A call per layer, fusing output and LSE into one
+    tensor to minimize NCCL call count. This reduces NCCL calls from 3
+    (standard DCP: AG+AG+RS) to 1 per layer, providing significant latency
+    savings on multi-node deployments where per-call NCCL overhead is high.
 
-    Communication pattern:
-        1. Split outputs/LSEs by head groups
-        2. All-to-All exchange (each rank sends chunks to all others)
-        3. Local LSE-weighted combination via Triton kernel (no more communication)
+    Packed A2A communication:
+        Output [B,H,D] and LSE [B,H] (fp32) are packed into a single tensor
+        [N,B,H/N,D+K] where K extra elements carry LSE via bit-exact dtype
+        reinterpretation (K=2 for bf16/fp16, K=1 for fp32). This preserves
+        full fp32 LSE precision with only +0.2% data volume overhead (D=512).
+
+    Send/recv buffers are cached by shape to avoid per-call allocation.
+    Cache is bounded to 8 entries; oldest evicted on overflow.
 
     Tensor flow:
         Input:  local_output [B, H, D] - all heads, local KV shard
-        Split:  [B, N, H/N, D] - split heads into N chunks
-        A2A:    Each rank sends chunk[i] to rank i, receives from all ranks
-        After:  recv_output [N, B, H/N, D] - all KV shards, local heads
-        Combine: output [B, H/N, D] - LSE-weighted sum across KV shards (Triton)
+        Pack:   [N, B, H/N, D+K] - output + LSE packed into one tensor
+        A2A:    Single all_to_all_single call
+        Unpack: recv_output [N, B, H/N, D], recv_lse [N, B, H/N]
+        Combine: output [B, H/N, D] - LSE-weighted sum (Triton kernel)
 
     Args:
         local_output: Local attention output [B, H, D] where:
@@ -330,55 +351,92 @@ def helix_alltoall_lse_reduce(
             return local_output, local_lse
         return local_output
 
-    # Ensure inputs are contiguous
+    # Ensure inputs are contiguous for reshape operations
     local_output = local_output.contiguous()
     local_lse = local_lse.contiguous()
 
     B, H, D = local_output.shape
     H_per_rank = H // world_size
 
-    # Step 1: Reshape for All-to-All
-    # [B, H, D] -> [B, N, H/N, D] -> [N, B, H/N, D]
-    send_output = local_output.view(B, world_size, H_per_rank, D)
-    send_output = send_output.permute(1, 0, 2, 3).contiguous()  # [N, B, H/N, D]
+    # Compute packing dimensions.
+    # fp32 LSE (4 bytes) is stored as K output-dtype elements via byte
+    # reinterpretation: K=2 for bf16/fp16 (2 bytes each), K=1 for fp32.
+    # This preserves bit-exact LSE precision (no value casting).
+    out_elem_size = local_output.element_size()
+    lse_extra_elems = 4 // out_elem_size
+    packed_D = D + lse_extra_elems
 
-    # [B, H] -> [B, N, H/N] -> [N, B, H/N]
-    send_lse = local_lse.view(B, world_size, H_per_rank)
-    send_lse = send_lse.permute(1, 0, 2).contiguous()  # [N, B, H/N]
-
-    # Step 2: All-to-All exchange
-    # After A2A: recv[i] contains rank i's partial output for MY local heads
-    recv_output = torch.empty_like(send_output)
-    recv_lse = torch.empty_like(send_lse)
-
-    # Use async_op=True to overlap the two all-to-all operations,
-    # then explicitly wait for completion before the Triton kernel.
-    # This fixes a race condition where the Triton kernel could start
-    # reading recv_output/recv_lse before NCCL finishes writing to them.
-    # (NCCL uses a separate stream from the compute stream)
-    work_output = dist.all_to_all_single(
-        recv_output.view(-1),
-        send_output.view(-1),
-        group=kvp_group.device_group,
-        async_op=True,
+    # Get or allocate cached send/recv buffers.
+    cache_key = (
+        B,
+        H_per_rank,
+        packed_D,
+        world_size,
+        local_output.dtype,
+        str(local_output.device),
     )
-    work_lse = dist.all_to_all_single(
-        recv_lse.view(-1),
-        send_lse.view(-1),
-        group=kvp_group.device_group,
-        async_op=True,
+    if cache_key in _a2a_buffers:
+        # Move to end (most recently used) for LRU eviction
+        _a2a_buffers.move_to_end(cache_key)
+        send_packed, recv_packed = _a2a_buffers[cache_key]
+    else:
+        packed_shape = (world_size, B, H_per_rank, packed_D)
+        send_packed = torch.empty(
+            packed_shape, dtype=local_output.dtype, device=local_output.device
+        )
+        recv_packed = torch.empty(
+            packed_shape, dtype=local_output.dtype, device=local_output.device
+        )
+        _a2a_buffers[cache_key] = (send_packed, recv_packed)
+        logger.debug(
+            "Helix A2A: allocated buffers for B=%d, packed_D=%d (cache entries: %d)",
+            B,
+            packed_D,
+            len(_a2a_buffers),
+        )
+        # Evict oldest entries if cache exceeds limit
+        while len(_a2a_buffers) > _A2A_CACHE_LIMIT:
+            evicted_key, _ = _a2a_buffers.popitem(last=False)
+            logger.debug("Helix A2A: evicted buffer cache entry B=%d", evicted_key[0])
+
+    # Pack output: [B, H, D] -> [B, N, H/N, D] -> [N, B, H/N, D]
+    # .copy_() from non-contiguous permuted view reuses the send buffer.
+    send_packed[:, :, :, :D].copy_(
+        local_output.view(B, world_size, H_per_rank, D).permute(1, 0, 2, 3)
     )
 
-    # Wait for both all-to-all operations to complete.
-    # This ensures recv_output and recv_lse are fully populated
-    # before the Triton kernel reads from them.
-    work_output.wait()
-    work_lse.wait()
+    # Pack LSE with bit-exact preservation via dtype reinterpretation.
+    # fp32 bytes are reinterpreted as output-dtype elements (no value cast).
+    # After A2A, view(fp32) reconstructs exact original values.
+    lse_permuted = (
+        local_lse.view(B, world_size, H_per_rank).permute(1, 0, 2).contiguous()
+    )  # [N, B, H/N] fp32
 
-    # recv_output shape: [N, B, H/N, D]
-    # recv_output[i] = rank i's partial output for my local heads
+    if out_elem_size == 4:
+        send_packed[:, :, :, D].copy_(lse_permuted)
+    else:
+        lse_reinterp = lse_permuted.view(local_output.dtype)
+        lse_reinterp = lse_reinterp.view(world_size, B, H_per_rank, lse_extra_elems)
+        send_packed[:, :, :, D:packed_D].copy_(lse_reinterp)
 
-    # Step 3: LSE-weighted combination via Triton kernel (LOCAL, no communication)
+    # Single A2A call (fused output + LSE)
+    dist.all_to_all_single(
+        recv_packed.view(-1), send_packed.view(-1), group=kvp_group.device_group
+    )
+
+    # Unpack output: [N, B, H/N, D]
+    recv_output = recv_packed[:, :, :, :D].contiguous()
+
+    # Unpack LSE with reverse reinterpretation: [N, B, H/N]
+    if out_elem_size == 4:
+        recv_lse = recv_packed[:, :, :, D].contiguous()
+    else:
+        recv_lse_raw = recv_packed[:, :, :, D:packed_D].contiguous()
+        recv_lse = recv_lse_raw.view(world_size, B, H_per_rank * lse_extra_elems).view(
+            torch.float32
+        )
+
+    # LSE-weighted combination via Triton kernel (local, no communication)
     return helix_lse_combine_triton(
         recv_output,
         recv_lse,
