@@ -295,34 +295,20 @@ class CudaPlatformBase(Platform):
                         AttentionBackendEnum.FLASH_ATTN
                     )
 
-        # DCP->PIECEWISE check for CUDA graph compatibility.
-        # DCP is incompatible with FULL CUDA graphs for GQA models because
-        # dcp_context_kv_lens tensor gets captured as static constant during
-        # graph capture, causing gibberish output during decode.
-        #
-        # However, MLA models use persistent buffers (seq_lens, dcp_local_seq_lens,
-        # dcp_tot_seq_lens) that are managed differently - they're slices of
-        # pre-allocated buffers with fixed addresses, making them compatible
-        # with FULL CUDA graphs.
+        # DCP CUDA graph compatibility note:
+        # Both GQA and MLA models now use persistent buffers for DCP tensors
+        # (dcp_context_kv_lens, dcp_local_seq_lens, dcp_tot_seq_lens),
+        # pre-computed on CPU in gpu_model_runner and copied to fixed GPU
+        # addresses. This makes FULL CUDA graphs compatible with DCP.
         from vllm.config import CUDAGraphMode
 
         compilation_config = vllm_config.compilation_config
         if compilation_config.cudagraph_mode.has_full_cudagraphs():
             if parallel_config.decode_context_parallel_size > 1:
-                # MLA models use persistent buffers - FULL graphs should work
-                if model_config is not None and model_config.use_mla:
-                    logger.info(
-                        "DCP with MLA detected. Keeping FULL CUDA graphs "
-                        "(MLA uses persistent buffers compatible with graph capture)."
-                    )
-                else:
-                    # GQA models need PIECEWISE due to dcp_context_kv_lens issue
-                    logger.warning_once(
-                        "Decode context parallel (DCP) is enabled with GQA model, "
-                        "which is incompatible with full CUDA graphs. "
-                        "Overriding cudagraph_mode to PIECEWISE."
-                    )
-                    compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
+                logger.info(
+                    "DCP detected with FULL CUDA graphs. Using persistent "
+                    "buffers for DCP tensors (compatible with graph capture)."
+                )
             elif parallel_config.prefill_context_parallel_size > 1:
                 logger.warning_once(
                     "Prefill context parallel (PCP) is enabled, which is "
