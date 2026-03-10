@@ -5,7 +5,8 @@
 Tests cover:
 1. DCP A2A config validation (--dcp-comm-backend)
 2. TPA config validation (--tensor-parallel-size-attention)
-3. LSE-weighted combination correctness
+3. KVP group function exists
+4. LSE-weighted combination correctness
 """
 
 import math
@@ -51,8 +52,8 @@ class TestDCPCommBackendConfig:
         assert config.dcp_comm_backend == "a2a"
 
     def test_invalid_backend_rejected(self):
-        """Invalid backend values are rejected (pydantic literal_error)."""
-        with pytest.raises((ValueError, Exception), match="ag_rs|a2a"):
+        """Invalid backend values are rejected."""
+        with pytest.raises(ValueError, match="must be one of"):
             ParallelConfig(
                 dcp_comm_backend="invalid",
             )
