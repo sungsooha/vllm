@@ -664,10 +664,16 @@ class FlashAttentionImpl(AttentionImpl):
         self,
         buf: torch.Tensor | None,
         num_tokens: int,
+        num_heads: int | None = None,
     ) -> torch.Tensor | None:
         """Slice pre-allocated FA output buffer, or None for prefill."""
         if buf is not None and num_tokens <= buf.shape[0]:
-            return buf[:num_tokens]
+            out = buf[:num_tokens]
+            # TPA GQA: Q is not all-gathered, so out needs fewer heads
+            # than the buffer (which is sized for the all-gathered case).
+            if num_heads is not None and num_heads < out.shape[1]:
+                out = out[:, :num_heads]
+            return out
         return None
 
     def forward(
@@ -906,7 +912,9 @@ class FlashAttentionImpl(AttentionImpl):
             q=context_q,
             k=key_cache,
             v=value_cache,
-            out=self._dcp_fa_out(self._dcp_context_out, context_q.shape[0]),
+            out=self._dcp_fa_out(
+                self._dcp_context_out, context_q.shape[0], context_q.shape[1]
+            ),
             cu_seqlens_q=cu_seqlens_q,
             max_seqlen_q=max_seqlen_q,
             seqused_k=attn_metadata.dcp_context_kv_lens,
