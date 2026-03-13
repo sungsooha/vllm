@@ -311,6 +311,16 @@ class FlashInferMLASparseImpl(SparseMLAAttentionImpl[FlashInferMLASparseMetadata
         # for query and kv_cache (mixed bf16+fp8 is not supported).
         self.supports_quant_query_input = True
 
+        # DCP LSE support — SparseMLAAttentionImpl base class doesn't
+        # have the _post_init() plumbing from MLACommonImpl, so we
+        # initialize DCP/LSE state directly here.
+        try:
+            from vllm.distributed.parallel_state import get_dcp_group
+
+            self.need_to_return_lse_for_decode = get_dcp_group().world_size > 1
+        except (AssertionError, ImportError):
+            self.need_to_return_lse_for_decode = False
+
     def forward_mqa(
         self,
         q: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
@@ -343,7 +353,7 @@ class FlashInferMLASparseImpl(SparseMLAAttentionImpl[FlashInferMLASparseMetadata
         if self.bmm2_scale is None:
             self.bmm2_scale = layer._v_scale_float
 
-        o = trtllm_batch_decode_with_kv_cache_mla(
+        result = trtllm_batch_decode_with_kv_cache_mla(
             query=q.unsqueeze(1),
             kv_cache=kv_c_and_k_pe_cache.unsqueeze(1),
             workspace_buffer=self._workspace_buffer,
@@ -356,5 +366,11 @@ class FlashInferMLASparseImpl(SparseMLAAttentionImpl[FlashInferMLASparseMetadata
             bmm1_scale=self.bmm1_scale,
             bmm2_scale=self.bmm2_scale,
             sparse_mla_top_k=attn_metadata.topk_tokens,
+            return_lse=self.need_to_return_lse_for_decode,
         )
-        return o.view(-1, o.shape[-2], o.shape[-1]), None
+
+        if self.need_to_return_lse_for_decode:
+            o, lse = result
+            return o.view(-1, o.shape[-2], o.shape[-1]), lse
+        else:
+            return result.view(-1, result.shape[-2], result.shape[-1]), None
