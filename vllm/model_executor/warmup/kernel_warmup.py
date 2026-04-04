@@ -54,6 +54,7 @@ def kernel_warmup(worker: "Worker"):
         except NotImplementedError:
             return False
 
+    pp_size = worker.vllm_config.parallel_config.pipeline_parallel_size
     if (
         not worker.model_runner.is_pooling_model
         and worker.model_runner.attn_groups
@@ -66,16 +67,23 @@ def kernel_warmup(worker: "Worker"):
             for group in groups
         )
     ):
-        logger.info("Warming up FlashInfer attention.")
-        # Warmup with mixed batch containing both prefill and decode tokens
-        # This is to warm up both prefill and decode attention kernels
-        worker.model_runner._dummy_run(
-            num_tokens=16,
-            skip_eplb=True,
-            is_profile=True,
-            force_attention=True,
-            create_mixed_batch=True,
-        )
+        if pp_size > 1:
+            # Skip FlashInfer attention warmup for PP > 1.
+            # The _dummy_run triggers TP all-reduce which deadlocks when
+            # PP ranks are at different warmup stages (e.g., some still in
+            # DeepGEMM warmup while others enter _dummy_run).
+            logger.info("Skipping FlashInfer attention warmup for PP=%d", pp_size)
+        else:
+            logger.info("Warming up FlashInfer attention.")
+            # Warmup with mixed batch containing both prefill and decode tokens
+            # This is to warm up both prefill and decode attention kernels
+            worker.model_runner._dummy_run(
+                num_tokens=16,
+                skip_eplb=True,
+                is_profile=True,
+                force_attention=True,
+                create_mixed_batch=True,
+            )
 
 
 def flashinfer_autotune(runner: "GPUModelRunner") -> None:

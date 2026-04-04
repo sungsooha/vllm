@@ -661,8 +661,21 @@ class Worker(WorkerBase):
             logger.debug(msg)
 
         if self.use_v2_model_runner:
-            # V2: Run full execute_model + sample_tokens to JIT compile triton kernels.
-            warmup_kernels(self.model_runner, self.execute_model, self.sample_tokens)
+            # V2: Run full execute_model + sample_tokens to JIT compile triton
+            # kernels. Skip for PP > 1 with Ray executor — warmup_kernels
+            # triggers NCCL PP communication that deadlocks with compiled DAG.
+            if (
+                self.parallel_config.pipeline_parallel_size > 1
+                and self.parallel_config.distributed_executor_backend == "ray"
+            ):
+                logger.info(
+                    "Skipping warmup_kernels for PP + Ray "
+                    "(NCCL PP deadlock with compiled DAG)"
+                )
+            else:
+                warmup_kernels(
+                    self.model_runner, self.execute_model, self.sample_tokens
+                )
         elif get_pp_group().is_last_rank:
             # V1: Warm up sampler and preallocate memory buffer for logits and other
             # sampling related tensors of max possible shape to avoid memory

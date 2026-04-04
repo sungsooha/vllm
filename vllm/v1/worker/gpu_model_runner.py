@@ -6171,7 +6171,7 @@ class GPUModelRunner(
             # attention backend subclasses (e.g. ChunkedLocalAttention) unless
             # they are cached correctly, there will be different objects per
             # layer.
-            for layer_name in kv_cache_group_spec.layer_names:
+            for layer_name in layers:
                 attn_backend = layers[layer_name].get_attn_backend()
 
                 if layer_name in self.kv_sharing_fast_prefill_eligible_layers:

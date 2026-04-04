@@ -51,7 +51,7 @@ def init_attn_backend(
         group_map: dict[tuple[tuple[str, str], KVCacheSpec], AttentionGroup] = {}
         group_order: list[tuple[tuple[str, str], KVCacheSpec]] = []
 
-        for layer_name in layer_names:
+        for layer_name in attn_layers:
             attn_backend = attn_layers[layer_name].get_attn_backend()
             attn_backends[layer_name] = attn_backend
 
@@ -116,6 +116,8 @@ def _reshape_kv_cache(
     kv_caches: dict[str, torch.Tensor] = {}
     for kv_cache_group_spec in kv_cache_config.kv_cache_groups:
         for layer_name in kv_cache_group_spec.layer_names:
+            if layer_name not in attn_backends:
+                continue
             kv_cache_spec = kv_cache_group_spec.kv_cache_spec
             if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
                 kv_cache_spec = kv_cache_spec.kv_cache_specs[layer_name]
