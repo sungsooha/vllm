@@ -978,6 +978,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         # Adjust seq_lens_cpu for DCP
         if self.use_dcp:
             assert seq_lens_cpu is not None
+            # Clone to avoid corrupting the persistent buffer that other
+            # builders (e.g., Mamba) read in the same scheduler step.
+            seq_lens_cpu = seq_lens_cpu.clone()
             if num_prefills > 0:
                 qo_indptr_prefill_cpu = (
                     qo_indptr_cpu[num_decodes:] - qo_indptr_cpu[num_decodes]
