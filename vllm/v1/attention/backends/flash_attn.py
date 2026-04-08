@@ -648,7 +648,9 @@ class FlashAttentionImpl(AttentionImpl):
                 "heads in the layer"
             )
 
-        self.supports_quant_query_input = True
+        # FA4 CUTE on SM100 doesn't support FP8 query inputs (asserts
+        # float16/bfloat16). Only enable Q quantization for FA3.
+        self.supports_quant_query_input = get_flash_attn_version() == 3
 
         vllm_config = get_current_vllm_config_or_none()
         dcp_a2a = (
