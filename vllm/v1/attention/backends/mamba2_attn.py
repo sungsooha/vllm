@@ -147,6 +147,8 @@ class Mamba2AttentionMetadataBuilder(
 
         # Compute seq_idx for prefill only
         if common.num_prefills > 0:
+            # DEBUG: sync to catch CUDA errors from prior operations
+            torch.cuda.synchronize()
             prep_initial_states = (
                 torch.any(common.has_initial_states_p).item()
                 if common.has_initial_states_p is not None

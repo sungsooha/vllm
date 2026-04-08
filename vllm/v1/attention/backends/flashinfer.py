@@ -995,6 +995,11 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 self.dcp_rank,
                 self.dcp_kv_cache_interleave_size,
             )
+            # Recalculate block counts for DCP-local seq_lens.
+            # The original num_blocks_np was computed from full seq_lens
+            # which includes blocks belonging to other DCP ranks.
+            seq_lens_np = seq_lens_cpu.numpy()
+            num_blocks_np = (seq_lens_np + (page_size - 1)) // page_size
 
         # Adjust num_block_np for cascade attention
         if use_cascade:
