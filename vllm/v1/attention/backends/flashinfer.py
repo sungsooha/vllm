@@ -325,6 +325,12 @@ class BatchDCPPrefillWrapper:
             output_query = output_query[:, start:end, :].contiguous()
             lse_query = lse_query[start:end, :].contiguous()
 
+        # FlashInfer returns LSE in log2 (base-2), but merge_attn_states
+        # uses tl.exp() which assumes base-e (natural log). Convert.
+        LN2 = 0.6931471805599453  # math.log(2.0)
+        lse_context = lse_context * LN2
+        lse_query = lse_query * LN2
+
         merge_attn_states(
             out,
             output_context,
