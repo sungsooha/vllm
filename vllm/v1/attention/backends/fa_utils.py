@@ -155,9 +155,14 @@ def get_flash_attn_version(
 
 
 def flash_attn_supports_fp8() -> bool:
+    fa_version = get_flash_attn_version()
     return (
-        get_flash_attn_version() == 3
-        and current_platform.is_device_capability_family(90)
+        fa_version is not None
+        and fa_version >= 3
+        and (
+            current_platform.is_device_capability_family(90)
+            or current_platform.is_device_capability_family(100)
+        )
     )
 
 
