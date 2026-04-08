@@ -597,8 +597,12 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             self.use_dcp and vllm_config.parallel_config.dcp_comm_backend == "a2a"
         )
 
-        self.num_qo_heads = self.model_config.get_num_attention_heads(
-            self.vllm_config.parallel_config
+        # Use TPA-aware TP size for attention head count
+        from vllm.distributed.parallel_state import get_attention_tp_world_size
+
+        attn_tp = get_attention_tp_world_size()
+        self.num_qo_heads = (
+            self.model_config.model_arch_config.total_num_attention_heads // attn_tp
         )
 
         self.num_kv_heads = self.kv_cache_spec.num_kv_heads
@@ -696,8 +700,13 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs)
             else [kv_cache_spec]
         )
-        num_qo_heads = vllm_config.model_config.get_num_attention_heads(
-            vllm_config.parallel_config
+        # Use TPA-aware TP size for attention head count
+        from vllm.distributed.parallel_state import get_attention_tp_world_size
+
+        attn_tp = get_attention_tp_world_size()
+        num_qo_heads = (
+            vllm_config.model_config.model_arch_config.total_num_attention_heads
+            // attn_tp
         )
         has_trtllm_support: bool = len(kv_specs) > 0
         for spec in kv_specs:
