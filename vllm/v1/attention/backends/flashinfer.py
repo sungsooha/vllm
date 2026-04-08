@@ -293,6 +293,10 @@ class BatchDCPPrefillWrapper:
             v_scale=layer._v_scale_float,
             return_lse=True,
         )
+        # FlashInfer attention may run on a non-default CUDA stream.
+        # Synchronize before DCP combine reads the output on the default
+        # stream to prevent race condition (Xid 31 MMU fault).
+        torch.accelerator.synchronize()
         output_context, lse_context = self._dcp_combine(
             output_context_tmp,
             lse_context_tmp,
@@ -1616,6 +1620,8 @@ class FlashInferImpl(AttentionImpl):
                         lse=lse,
                         return_lse=True,
                     )
+                    # Sync: FlashInfer may use a non-default CUDA stream.
+                    torch.accelerator.synchronize()
                     output[:num_decode_tokens] = self.dcp_combine(
                         output_tmp,
                         lse,
