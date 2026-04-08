@@ -50,7 +50,11 @@ class SingleTypeKVCacheManager(ABC):
         self.block_size = kv_cache_spec.block_size
         self.dcp_world_size = dcp_world_size
         self.pcp_world_size = pcp_world_size
-        if dcp_world_size * pcp_world_size > 1:
+        # Only scale block_size for attention KV cache, not Mamba state
+        # (Mamba state is fixed-size, not per-position)
+        if dcp_world_size * pcp_world_size > 1 and not isinstance(
+            kv_cache_spec, MambaSpec
+        ):
             self.block_size *= dcp_world_size * pcp_world_size
         self.kv_cache_spec = kv_cache_spec
         self.block_pool = block_pool
@@ -791,7 +795,8 @@ class MambaManager(SingleTypeKVCacheManager):
         assert isinstance(kv_cache_spec, MambaSpec), (
             "MambaManager can only be used for mamba groups"
         )
-        assert dcp_world_size == 1, "DCP not support mamba now."
+        # Mamba state is DCP-transparent (fixed-size, not per-position).
+        # Each DCP rank independently maintains identical Mamba state.
         assert pcp_world_size == 1, "PCP not support mamba now."
         computed_blocks: tuple[list[KVCacheBlock], ...] = tuple(
             [] for _ in range(len(kv_cache_group_ids))

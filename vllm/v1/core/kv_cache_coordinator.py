@@ -403,7 +403,27 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             g.kv_cache_spec.block_size % hash_block_size == 0
             for g in kv_cache_config.kv_cache_groups
         ), "block_size must be divisible by hash_block_size"
-        assert dcp_world_size == 1, "DCP not support hybrid attn now."
+        # DCP is supported for hybrid models: attention groups get the real
+        # dcp_world_size, while non-attention groups (e.g., Mamba) get
+        # dcp_world_size=1 since their state is DCP-transparent.
+        # Override the sub-managers created by the parent class to fix
+        # the dcp_world_size for non-attention (Mamba) groups.
+        if dcp_world_size > 1:
+            self.single_type_managers = tuple(
+                get_manager_for_kv_cache_spec(
+                    kv_cache_spec=g.kv_cache_spec,
+                    block_pool=self.block_pool,
+                    enable_caching=enable_caching,
+                    kv_cache_group_id=i,
+                    dcp_world_size=(
+                        dcp_world_size
+                        if isinstance(g.kv_cache_spec, FullAttentionSpec)
+                        else 1
+                    ),
+                    pcp_world_size=pcp_world_size,
+                )
+                for i, g in enumerate(self.kv_cache_config.kv_cache_groups)
+            )
         assert pcp_world_size == 1, "PCP not support hybrid attn now."
         self.verify_and_split_kv_cache_groups()
 
