@@ -1255,10 +1255,18 @@ class FlashInferImpl(AttentionImpl):
 
         self.support_trtllm_attn = can_use_trtllm_attention(num_heads, num_kv_heads)
         vllm_config = get_current_vllm_config_or_none()
+        # Only quantize Q when TRT-LLM attention is used AND DCP is not
+        # active. With DCP, the FlashInfer native forward path handles
+        # attention (not TRT-LLM), and it expects bf16 Q.
+        use_dcp = (
+            vllm_config is not None
+            and vllm_config.parallel_config.decode_context_parallel_size > 1
+        )
         self.supports_quant_query_input = (
             self.support_trtllm_attn
             and vllm_config is not None
             and not vllm_config.attention_config.disable_flashinfer_q_quantization
+            and not use_dcp
         )
         self.bmm1_scale: float | None = None
         self.bmm2_scale: float | None = None
