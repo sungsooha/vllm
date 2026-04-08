@@ -309,6 +309,20 @@ class BatchDCPPrefillWrapper:
         )
         lse_query = lse_query.transpose(0, 1).contiguous()
 
+        # TPA GQA: slice query output to match context output shape.
+        # Query attention runs on all TPA heads, but DCP combine produced
+        # per-rank heads. Slice to this rank's portion for merge.
+        if is_tpa_gqa_mode():
+            dcp_group = get_dcp_group()
+            dcp_rank = dcp_group.rank_in_group
+            dcp_size = dcp_group.world_size
+            num_heads = output_query.shape[1]
+            heads_per_rank = num_heads // dcp_size
+            start = dcp_rank * heads_per_rank
+            end = start + heads_per_rank
+            output_query = output_query[:, start:end, :].contiguous()
+            lse_query = lse_query[start:end, :].contiguous()
+
         merge_attn_states(
             out,
             output_context,
