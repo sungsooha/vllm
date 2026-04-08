@@ -26,7 +26,7 @@ from vllm.config import (
     get_current_vllm_config_or_none,
 )
 from vllm.config.cache import CacheDType
-from vllm.distributed.parallel_state import get_dcp_group
+from vllm.distributed.parallel_state import get_dcp_group, is_tpa_gqa_mode
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
@@ -242,7 +242,9 @@ class BatchDCPPrefillWrapper:
             paged_kv_indptr=paged_kv_indptr_cpu,
             paged_kv_indices=paged_kv_indices,
             paged_kv_last_page_len=paged_kv_last_page_len_cpu,
-            num_qo_heads=num_qo_heads * dcp_world_size,
+            num_qo_heads=(
+                num_qo_heads if is_tpa_gqa_mode() else num_qo_heads * dcp_world_size
+            ),
             num_kv_heads=num_kv_heads,
             head_dim_qk=head_dim,
             page_size=page_size,
@@ -278,9 +280,12 @@ class BatchDCPPrefillWrapper:
         value: torch.Tensor,
         out: torch.Tensor,
     ):
-        prefill_query_across_dcp = get_dcp_group().all_gather(
-            prefill_query.contiguous(), dim=1
-        )
+        if is_tpa_gqa_mode():
+            prefill_query_across_dcp = prefill_query.contiguous()
+        else:
+            prefill_query_across_dcp = get_dcp_group().all_gather(
+                prefill_query.contiguous(), dim=1
+            )
         output_context_tmp, lse_context_tmp = self._context.run(
             prefill_query_across_dcp,
             kv_cache_permute,
@@ -1161,7 +1166,11 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     last_page_len_cpu=self.paged_kv_last_page_len.cpu[
                         :num_input_tokens
                     ],
-                    num_qo_heads=self.num_qo_heads * self.dcp_world_size,
+                    num_qo_heads=(
+                        self.num_qo_heads
+                        if is_tpa_gqa_mode()
+                        else self.num_qo_heads * self.dcp_world_size
+                    ),
                     num_kv_heads=self.num_kv_heads,
                     head_dim=self.head_dim,
                     page_size=self.page_size,
@@ -1547,9 +1556,12 @@ class FlashInferImpl(AttentionImpl):
                 assert decode_wrapper._sm_scale == self.scale
 
                 if use_dcp:
-                    decode_query = get_dcp_group().all_gather(
-                        decode_query.contiguous(), dim=-2
-                    )
+                    if not is_tpa_gqa_mode():
+                        decode_query = get_dcp_group().all_gather(
+                            decode_query.contiguous(), dim=-2
+                        )
+                    else:
+                        decode_query = decode_query.contiguous()
                     output_tmp = torch.empty_like(decode_query)
                     lse = torch.empty(
                         (decode_query.size(0), decode_query.size(1)),
