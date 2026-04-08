@@ -293,10 +293,6 @@ class BatchDCPPrefillWrapper:
             v_scale=layer._v_scale_float,
             return_lse=True,
         )
-        # FlashInfer attention may run on a non-default CUDA stream.
-        # Synchronize before DCP combine reads the output on the default
-        # stream to prevent race condition (Xid 31 MMU fault).
-        torch.accelerator.synchronize()
         output_context, lse_context = self._dcp_combine(
             output_context_tmp,
             lse_context_tmp,
@@ -305,10 +301,12 @@ class BatchDCPPrefillWrapper:
         )
         lse_context = lse_context.transpose(0, 1).contiguous()
 
+        # FlashInfer ragged KV requires contiguous inputs. The query/key/value
+        # may be non-contiguous slices (e.g., key[num_decode_tokens:]).
         output_query, lse_query = self._new_tokens.run(
-            prefill_query,
-            key,
-            value,
+            prefill_query.contiguous(),
+            key.contiguous(),
+            value.contiguous(),
             return_lse=True,
         )
         lse_query = lse_query.transpose(0, 1).contiguous()
@@ -1620,8 +1618,6 @@ class FlashInferImpl(AttentionImpl):
                         lse=lse,
                         return_lse=True,
                     )
-                    # Sync: FlashInfer may use a non-default CUDA stream.
-                    torch.accelerator.synchronize()
                     output[:num_decode_tokens] = self.dcp_combine(
                         output_tmp,
                         lse,
