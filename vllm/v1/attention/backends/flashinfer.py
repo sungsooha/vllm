@@ -213,9 +213,11 @@ class BatchDCPPrefillWrapper:
         self._context = BatchPrefillWithPagedKVCacheWrapper(
             workspace_buffer, get_kv_cache_layout()
         )
-        self._new_tokens = BatchPrefillWithRaggedKVCacheWrapper(
-            workspace_buffer, get_kv_cache_layout()
-        )
+        # Raw K/V tensors from the model forward are always in NHD layout.
+        # The paged KV cache may use HND on SM100, but the ragged wrapper
+        # processes raw tensors. Using HND dispatches to a buggy CUTLASS
+        # kernel on SM100 (FlashInfer Issue #1663).
+        self._new_tokens = BatchPrefillWithRaggedKVCacheWrapper(workspace_buffer, "NHD")
 
     def plan(
         self,
