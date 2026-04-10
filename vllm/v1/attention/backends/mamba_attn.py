@@ -148,7 +148,16 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
                 device=device,
             )
 
-        self._init_reorder_batch_threshold(1, self.use_spec_decode)
+        # Mamba state is DCP-transparent (not sharded across DCP ranks),
+        # so DCP's threshold=1 override should NOT apply to Mamba.
+        # Pass supports_dcp_with_varlen=True to preserve the spec decode
+        # threshold (1+k), which is needed for correct decode/prefill
+        # classification in the Mamba kernel path.
+        self._init_reorder_batch_threshold(
+            1,
+            self.use_spec_decode,
+            supports_dcp_with_varlen=True,
+        )
         if self.use_spec_decode:
             self.supports_update_block_table = False
 
@@ -500,7 +509,11 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
             and self.compilation_config.cudagraph_mode.has_full_cudagraphs()
         ):
             padded_bs = metadata.num_reqs
-            self.state_indices_tensor_d[: metadata.num_decodes].copy_(
+            # During profiling, block_table may have fewer columns than
+            # max_num_blocks (minimal KV cache). Slice to match.
+            assert state_indices_tensor_d is not None
+            src_width = state_indices_tensor_d.shape[1]
+            self.state_indices_tensor_d[: metadata.num_decodes, :src_width].copy_(
                 state_indices_tensor_d, non_blocking=True
             )
             state_indices_tensor_d = self.state_indices_tensor_d[:padded_bs]

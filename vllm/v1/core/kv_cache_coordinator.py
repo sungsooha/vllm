@@ -383,6 +383,23 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         hash_block_size: int,
         metrics_collector: KVCacheMetricsCollector | None = None,
     ):
+        # Clamp hash_block_size BEFORE super().__init__() so the BlockPool
+        # is created with the correct value.  With DCP, scheduler passes
+        # hash_block_size = base_block_size * dcp, which may exceed the
+        # Mamba group's raw block_size.  Clamp to the min group block_size
+        # so it divides ALL groups' block_sizes.
+        min_group_block_size = min(
+            g.kv_cache_spec.block_size for g in kv_cache_config.kv_cache_groups
+        )
+        clamped_hash_block_size = min(hash_block_size, min_group_block_size)
+        assert all(
+            g.kv_cache_spec.block_size % clamped_hash_block_size == 0
+            for g in kv_cache_config.kv_cache_groups
+        ), (
+            f"block_size must be divisible by hash_block_size "
+            f"({clamped_hash_block_size}), got: "
+            f"{[g.kv_cache_spec.block_size for g in kv_cache_config.kv_cache_groups]}"
+        )
         super().__init__(
             kv_cache_config,
             max_model_len,
@@ -391,18 +408,10 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             enable_kv_cache_events,
             dcp_world_size=dcp_world_size,
             pcp_world_size=pcp_world_size,
-            hash_block_size=hash_block_size,
+            hash_block_size=clamped_hash_block_size,
             metrics_collector=metrics_collector,
         )
-        # hash_block_size: the block size used to compute block hashes.
-        # The actual block size usually equals hash_block_size, but in cases where
-        # different KV cache groups have different block sizes, the actual block size
-        # can be a multiple of hash_block_size.
-        self.hash_block_size = hash_block_size
-        assert all(
-            g.kv_cache_spec.block_size % hash_block_size == 0
-            for g in kv_cache_config.kv_cache_groups
-        ), "block_size must be divisible by hash_block_size"
+        self.hash_block_size = clamped_hash_block_size
         # DCP is supported for hybrid models: attention groups get the real
         # dcp_world_size, while non-attention groups (e.g., Mamba) get
         # dcp_world_size=1 since their state is DCP-transparent.
@@ -425,6 +434,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 for i, g in enumerate(self.kv_cache_config.kv_cache_groups)
             )
         assert pcp_world_size == 1, "PCP not support hybrid attn now."
+        self.dcp_world_size = dcp_world_size
         self.verify_and_split_kv_cache_groups()
 
     def verify_and_split_kv_cache_groups(self) -> None:
@@ -462,13 +472,33 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             key=lambda x: not isinstance(x[0], FullAttentionSpec),
         )
 
-        # The LCM of the block sizes of all attention types.
-        # The cache hit length must be a multiple of the LCM of the block sizes
-        # to make sure the cache hit length is a multiple of the block size of
-        # each attention type. Requiring this because we don't support partial
-        # block cache hit yet.
-        block_sizes = [spec.block_size for spec, _, _ in attention_groups]
+        # The LCM of the effective block sizes of all attention types.
+        # With DCP, attention block_size is scaled by dcp_world_size but
+        # Mamba block_size is not. Use effective (DCP-scaled) block sizes
+        # so cache hit alignment works correctly for all groups.
+        block_sizes = [
+            spec.block_size * self.dcp_world_size
+            if isinstance(spec, FullAttentionSpec) and self.dcp_world_size > 1
+            else spec.block_size
+            for spec, _, _ in attention_groups
+        ]
         self.lcm_block_size = lcm(*block_sizes)
+
+    def _effective_block_size(self, spec: KVCacheSpec) -> int:
+        """Get the DCP-scaled block size for a spec.
+
+        Attention groups scale by dcp_world_size; Mamba groups do not
+        (Mamba state is fixed-size, DCP-transparent).
+        """
+        if isinstance(spec, FullAttentionSpec) and self.dcp_world_size > 1:
+            return spec.block_size * self.dcp_world_size
+        return spec.block_size
+
+    def _group_dcp_world_size(self, spec: KVCacheSpec) -> int:
+        """Get the dcp_world_size applicable to a spec type."""
+        if isinstance(spec, FullAttentionSpec):
+            return self.dcp_world_size
+        return 1
 
     def find_longest_cache_hit(
         self,
@@ -519,6 +549,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
 
             for spec, group_ids, manager_cls in self.attention_groups:
                 is_full_attn = isinstance(spec, FullAttentionSpec)
+                eff_block_size = self._effective_block_size(spec)
 
                 # Full attention: reuse cached blocks (downward-closed property)
                 cached_blocks = hit_blocks_by_group[group_ids[0]]
@@ -528,8 +559,8 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     # curr_hit_length is reduced by other groups, we can simply
                     # keep the first (curr_hit_length // block_size) blocks from
                     # the last iteration.
-                    num_blocks = curr_hit_length // spec.block_size
-                    curr_hit_length = num_blocks * spec.block_size
+                    num_blocks = curr_hit_length // eff_block_size
+                    curr_hit_length = num_blocks * eff_block_size
                 else:
                     hit_blocks = manager_cls.find_longest_cache_hit(
                         block_hashes=_get_block_hashes(spec),
@@ -539,8 +570,9 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                         kv_cache_spec=spec,
                         use_eagle=self.use_eagle,
                         alignment_tokens=self.lcm_block_size,
+                        dcp_world_size=self._group_dcp_world_size(spec),
                     )
-                    curr_hit_length = len(hit_blocks[0]) * spec.block_size
+                    curr_hit_length = len(hit_blocks[0]) * eff_block_size
                     for group_id, blocks in zip(group_ids, hit_blocks):
                         hit_blocks_by_group[group_id] = blocks
 
@@ -554,7 +586,8 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         # Truncate full attention blocks to final hit_length (if present)
         spec, group_ids, _ = self.attention_groups[0]
         if isinstance(spec, FullAttentionSpec):
-            num_blocks = hit_length // spec.block_size
+            eff_block_size = self._effective_block_size(spec)
+            num_blocks = hit_length // eff_block_size
             for group_id in group_ids:
                 if (blks := hit_blocks_by_group[group_id]) is not None:
                     del blks[num_blocks:]

@@ -205,19 +205,38 @@ class BatchDCPPrefillWrapper:
         self,
         workspace_buffer: torch.Tensor | None = None,
         dcp_a2a: bool = False,
+        use_cuda_graph: bool = False,
+        qo_indptr_buf: torch.Tensor | None = None,
+        paged_kv_indptr_buf: torch.Tensor | None = None,
+        paged_kv_indices_buf: torch.Tensor | None = None,
+        paged_kv_last_page_len_buf: torch.Tensor | None = None,
     ):
         if dcp_a2a:
             self._dcp_combine = partial(dcp_a2a_lse_reduce, is_lse_base_on_e=False)
         else:
             self._dcp_combine = partial(cp_lse_ag_out_rs, is_lse_base_on_e=False)
         self._context = BatchPrefillWithPagedKVCacheWrapper(
-            workspace_buffer, get_kv_cache_layout()
+            workspace_buffer,
+            get_kv_cache_layout(),
+            use_cuda_graph=use_cuda_graph,
+            qo_indptr_buf=qo_indptr_buf,
+            paged_kv_indptr_buf=paged_kv_indptr_buf,
+            paged_kv_indices_buf=paged_kv_indices_buf,
+            paged_kv_last_page_len_buf=paged_kv_last_page_len_buf,
         )
         # Raw K/V tensors from the model forward are always in NHD layout.
         # The paged KV cache may use HND on SM100, but the ragged wrapper
         # processes raw tensors. Using HND dispatches to a buggy CUTLASS
         # kernel on SM100 (FlashInfer Issue #1663).
-        self._new_tokens = BatchPrefillWithRaggedKVCacheWrapper(workspace_buffer, "NHD")
+        # For new_tokens ragged wrapper: qo_indptr and kv_indptr are the
+        # same (self-attention on new tokens), so share the buffer.
+        self._new_tokens = BatchPrefillWithRaggedKVCacheWrapper(
+            workspace_buffer,
+            "NHD",
+            use_cuda_graph=use_cuda_graph,
+            qo_indptr_buf=qo_indptr_buf,
+            kv_indptr_buf=qo_indptr_buf,  # same as qo for self-attention
+        )
 
     def plan(
         self,
@@ -288,6 +307,7 @@ class BatchDCPPrefillWrapper:
             prefill_query_across_dcp = get_dcp_group().all_gather(
                 prefill_query.contiguous(), dim=1
             )
+
         output_context_tmp, lse_context_tmp = self._context.run(
             prefill_query_across_dcp,
             kv_cache_permute,
@@ -599,6 +619,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             self._decode_wrappers_cudagraph: dict[
                 int, BatchDecodeWithPagedKVCacheWrapper
             ] = {}
+            # For DCP + MTP/EAGLE: graph-compatible DCP prefill wrappers
+            # (one per batch size, same pattern as decode wrappers).
+            self._dcp_prefill_wrappers_cudagraph: dict[int, BatchDCPPrefillWrapper] = {}
             self._decode_cudagraph_max_bs = (1 + num_spec_tokens) * max_num_reqs
             if self.compilation_config.max_cudagraph_capture_size is not None:
                 self._decode_cudagraph_max_bs = min(
@@ -745,6 +768,10 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 has_trtllm_support = False
                 break
 
+        # DCP disables TRTLLM decode at runtime (no LSE return support),
+        # but the DCP prefill wrapper supports CUDA graphs via persistent
+        # buffers (use_cuda_graph=True). So DCP + MTP/EAGLE can use FULL
+        # CUDA graphs through the graph-compatible DCP prefill wrapper.
         if has_trtllm_support:
             return AttentionCGSupport.UNIFORM_BATCH
         else:
@@ -762,6 +789,29 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
 
     def set_workspace_buffer(self, workspace_buffer: torch.Tensor):
         self._workspace_buffer = workspace_buffer
+
+    def _get_dcp_prefill_wrapper_cudagraph(
+        self,
+        batch_size: int,
+    ) -> BatchDCPPrefillWrapper:
+        """Get or create a graph-compatible DCP prefill wrapper for the
+        given batch size. Uses persistent buffers at fixed GPU addresses
+        so FULL CUDA graphs can capture and replay correctly."""
+        wrapper = self._dcp_prefill_wrappers_cudagraph.get(batch_size)
+        if wrapper is None:
+            wrapper = BatchDCPPrefillWrapper(
+                workspace_buffer=self._get_workspace_buffer(),
+                dcp_a2a=self.dcp_a2a,
+                use_cuda_graph=True,
+                qo_indptr_buf=self.paged_kv_indptr.gpu[: batch_size + 1],
+                paged_kv_indptr_buf=self.paged_kv_indptr_cpu_buffer[
+                    : batch_size + 1
+                ].to(self.device),
+                paged_kv_indices_buf=self.paged_kv_indices.gpu,
+                paged_kv_last_page_len_buf=self.paged_kv_last_page_len.gpu[:batch_size],
+            )
+            self._dcp_prefill_wrappers_cudagraph[batch_size] = wrapper
+        return wrapper
 
     def _get_prefill_wrapper(
         self,
@@ -1116,7 +1166,22 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     max_seq_len=max_seq_len,
                 )
             else:
-                prefill_wrapper = self._get_prefill_wrapper()
+                # For FULL CUDA graphs with DCP + MTP/EAGLE (all prefills,
+                # no decodes): use graph-compatible DCP prefill wrapper with
+                # persistent buffers at fixed addresses.
+                use_dcp_prefill_cudagraph = (
+                    self.enable_cuda_graph
+                    and self.use_dcp
+                    and num_decodes == 0
+                    and num_prefill_tokens <= self._decode_cudagraph_max_bs
+                )
+                if use_dcp_prefill_cudagraph:
+                    # batch_size = num_prefills (requests), not tokens
+                    prefill_wrapper = self._get_dcp_prefill_wrapper_cudagraph(
+                        num_prefills
+                    )
+                else:
+                    prefill_wrapper = self._get_prefill_wrapper()
                 # Slicing CPU buffers that are only needed for FI native prefills
                 paged_kv_last_page_len_prefill_cpu = self.paged_kv_last_page_len.cpu[
                     prefill_start:num_reqs

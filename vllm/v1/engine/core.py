@@ -203,8 +203,20 @@ class EngineCore:
             )
             init_none_hash(caching_hash_fn)
 
+            # For hybrid models (multiple KV cache groups), the hash
+            # granularity must divide ALL groups' block_sizes.  With DCP,
+            # scheduler_block_size is base*DCP which may exceed the Mamba
+            # group's raw block_size.  Clamp to the min group block_size
+            # so every group can convert hashes via BlockHashListWithBlockSize.
+            hash_block_size = scheduler_block_size
+            if len(kv_cache_config.kv_cache_groups) > 1:
+                min_group_bs = min(
+                    g.kv_cache_spec.block_size for g in kv_cache_config.kv_cache_groups
+                )
+                hash_block_size = min(hash_block_size, min_group_bs)
+
             self.request_block_hasher = get_request_block_hasher(
-                scheduler_block_size, caching_hash_fn
+                hash_block_size, caching_hash_fn
             )
 
         self.step_fn = (
