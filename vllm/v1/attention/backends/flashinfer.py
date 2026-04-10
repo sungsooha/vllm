@@ -1169,11 +1169,23 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 # For FULL CUDA graphs with DCP + MTP/EAGLE (all prefills,
                 # no decodes): use graph-compatible DCP prefill wrapper with
                 # persistent buffers at fixed addresses.
+                # Graph-compatible DCP prefill ONLY for MTP/EAGLE uniform
+                # decode batches (all requests have same small query_len).
+                # Real prefills (varying query_lens, large tokens) use the
+                # non-graph wrapper to avoid buffer overflow.
+                spec_config = self.vllm_config.speculative_config
+                is_uniform_spec_decode = (
+                    spec_config is not None
+                    and spec_config.num_speculative_tokens > 0
+                    and num_prefills > 0
+                    and num_prefill_tokens
+                    == num_prefills * (1 + spec_config.num_speculative_tokens)
+                )
                 use_dcp_prefill_cudagraph = (
                     self.enable_cuda_graph
                     and self.use_dcp
                     and num_decodes == 0
-                    and num_prefill_tokens <= self._decode_cudagraph_max_bs
+                    and is_uniform_spec_decode
                 )
                 if use_dcp_prefill_cudagraph:
                     # batch_size = num_prefills (requests), not tokens
