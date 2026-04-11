@@ -544,16 +544,18 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
                     non_blocking=True,
                 )
                 block_idx_last_scheduled_token = self.block_idx_last_scheduled_token[
-                    : metadata.num_decode_tokens
+                    :padded_bs
                 ]
+                block_idx_last_scheduled_token[metadata.num_decodes :] = 0
 
                 self.block_idx_last_computed_token[: metadata.num_decodes].copy_(
                     block_idx_last_computed_token[: metadata.num_decodes],
                     non_blocking=True,
                 )
                 block_idx_last_computed_token = self.block_idx_last_computed_token[
-                    : metadata.num_decode_tokens
+                    :padded_bs
                 ]
+                block_idx_last_computed_token[metadata.num_decodes :] = 0
 
         return replace(
             metadata,
