@@ -414,12 +414,15 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
         if state_indices_tensor.dim() == 1:
             state_indices_tensor = state_indices_tensor.unsqueeze(-1)
 
-        # During CUDA graph capture/replay, tensors may be padded beyond
-        # num_reqs. Use tensor size minus num_prefills for decode portion
-        # so split sizes always sum to tensor size (preserving graph shapes).
+        # During CUDA graph capture, block_table_tensor may be padded
+        # beyond num_reqs. Slice to actual request count before splitting.
+        total_reqs = num_decodes + num_prefills
+        if state_indices_tensor.shape[0] > total_reqs:
+            state_indices_tensor = state_indices_tensor[:total_reqs]
+
         state_indices_tensor_d, state_indices_tensor_p = torch.split(
             state_indices_tensor,
-            [state_indices_tensor.shape[0] - num_prefills, num_prefills],
+            [num_decodes, num_prefills],
             dim=0,
         )
         if self.vllm_config.cache_config.mamba_cache_mode != "all":
@@ -576,15 +579,20 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
         if state_indices_tensor.dim() == 1:
             state_indices_tensor = state_indices_tensor.unsqueeze(-1)
 
-        # During CUDA graph capture/replay, tensors may be padded beyond
-        # num_reqs. Use tensor size minus num_prefills for decode portion
-        # so split sizes always sum to tensor size (preserving graph shapes).
+        # Slice to actual request count (may be padded during CUDA graph)
+        total_reqs = metadata.num_prefills + metadata.num_decodes
+        if state_indices_tensor.shape[0] > total_reqs:
+            state_indices_tensor = state_indices_tensor[:total_reqs]
+
+        assert total_reqs == state_indices_tensor.shape[0], (
+            "Mismatch in number of requests when updating block table."
+            f" Expected {total_reqs}, "
+            f"got {state_indices_tensor.shape[0]}."
+        )
+
         state_indices_tensor_d, state_indices_tensor_p = torch.split(
             state_indices_tensor,
-            [
-                state_indices_tensor.shape[0] - metadata.num_prefills,
-                metadata.num_prefills,
-            ],
+            [metadata.num_decodes, metadata.num_prefills],
             dim=0,
         )
         if self.vllm_config.cache_config.mamba_cache_mode != "all":
