@@ -414,6 +414,12 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
         if state_indices_tensor.dim() == 1:
             state_indices_tensor = state_indices_tensor.unsqueeze(-1)
 
+        # During CUDA graph capture, block_table_tensor may be padded
+        # beyond num_reqs. Slice to actual request count before splitting.
+        total_reqs = num_decodes + num_prefills
+        if state_indices_tensor.shape[0] > total_reqs:
+            state_indices_tensor = state_indices_tensor[:total_reqs]
+
         state_indices_tensor_d, state_indices_tensor_p = torch.split(
             state_indices_tensor,
             [num_decodes, num_prefills],
@@ -573,12 +579,14 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
         if state_indices_tensor.dim() == 1:
             state_indices_tensor = state_indices_tensor.unsqueeze(-1)
 
-        assert (
-            metadata.num_prefills + metadata.num_decodes
-            == state_indices_tensor.shape[0]
-        ), (
+        # Slice to actual request count (may be padded during CUDA graph)
+        total_reqs = metadata.num_prefills + metadata.num_decodes
+        if state_indices_tensor.shape[0] > total_reqs:
+            state_indices_tensor = state_indices_tensor[:total_reqs]
+
+        assert total_reqs == state_indices_tensor.shape[0], (
             "Mismatch in number of requests when updating block table."
-            f" Expected {metadata.num_prefills + metadata.num_decodes}, "
+            f" Expected {total_reqs}, "
             f"got {state_indices_tensor.shape[0]}."
         )
 
