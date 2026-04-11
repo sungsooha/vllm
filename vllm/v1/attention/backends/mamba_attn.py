@@ -107,18 +107,21 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
             )
 
         if self.vllm_config.cache_config.mamba_cache_mode == "all":
-            max_num_blocks = cdiv(
-                self.vllm_config.model_config.max_model_len,
-                self.kv_cache_spec.block_size,
+            # Match gpu_model_runner's max_num_blocks_per_req formula:
+            # cdiv(max_model_len, block_size * cp_world_size) + num_spec_blocks
+            cp_world_size = max(
+                self.vllm_config.parallel_config.decode_context_parallel_size,
+                1,
             )
-            # Speculative decoding not supported with prefix caching,
-            # so keep shape consistent with prefill buffer
-            # TODO: reduce this size as needed for decode-only cudagraph capture
-            self.state_indices_tensor_d: torch.Tensor = torch.empty(
-                (
-                    self.decode_cudagraph_max_bs,
-                    max_num_blocks,
-                ),
+            max_num_blocks = (
+                cdiv(
+                    self.vllm_config.model_config.max_model_len,
+                    self.kv_cache_spec.block_size * cp_world_size,
+                )
+                + self.kv_cache_spec.num_speculative_blocks
+            )
+            self.state_indices_tensor_d = torch.empty(
+                (self.decode_cudagraph_max_bs, max_num_blocks),
                 dtype=torch.int32,
                 device=device,
             )
