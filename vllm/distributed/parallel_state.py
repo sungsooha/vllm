@@ -1271,6 +1271,39 @@ def get_attention_tp_rank(disable_parallel: bool = False) -> int:
     return get_tensor_model_parallel_rank()
 
 
+# --- Per-layer parallel config: prefix-based TP resolution ---
+
+
+def get_tp_world_size_for_prefix(prefix: str, disable_parallel: bool = False) -> int:
+    """Get effective TP world size for a given module prefix.
+
+    Uses the per-layer parallel registry. Falls back to global TP.
+    """
+    if disable_parallel:
+        return 1
+    from vllm.distributed.layer_parallel_config import get_layer_parallel_config
+
+    config = get_layer_parallel_config(prefix)
+    if config.tp_size is not None:
+        return config.tp_size
+    return get_tensor_model_parallel_world_size()
+
+
+def get_tp_rank_for_prefix(prefix: str, disable_parallel: bool = False) -> int:
+    """Get effective TP rank for a given module prefix.
+
+    Uses the per-layer parallel registry. Falls back to global TP rank.
+    """
+    if disable_parallel:
+        return 0
+    from vllm.distributed.layer_parallel_config import get_layer_parallel_config
+
+    config = get_layer_parallel_config(prefix)
+    if config.tp_rank is not None:
+        return config.tp_rank
+    return get_tensor_model_parallel_rank()
+
+
 _PP: GroupCoordinator | None = None
 
 
@@ -1646,6 +1679,26 @@ def initialize_model_parallel(
             _TPA_SIZE,
             config.parallel_config.dcp_size,
         )
+
+        # Populate per-layer parallel registry from TPA config.
+        from vllm.distributed.layer_parallel_config import (
+            LayerParallelConfig,
+            clear_layer_parallel_registry,
+            register_layer_parallel_config,
+        )
+
+        clear_layer_parallel_registry()
+        tp_rank = get_tensor_model_parallel_rank()
+        dcp_size = get_dcp_group().world_size
+        attn_tp_rank = tp_rank // dcp_size if dcp_size > 1 else tp_rank
+        for pattern in (".self_attn.", ".attention.", ".attn."):
+            register_layer_parallel_config(
+                pattern,
+                LayerParallelConfig(
+                    tp_size=_TPA_SIZE,
+                    tp_rank=attn_tp_rank,
+                ),
+            )
 
     global _PCP
     assert _PCP is None, "prefill context parallel group is already initialized"

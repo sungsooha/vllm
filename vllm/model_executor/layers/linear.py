@@ -1005,8 +1005,19 @@ class QKVParallelLinear(ColumnParallelLinear):
         self.total_num_kv_heads = total_num_kv_heads
         # Divide the weight matrix along the last dimension.
         tp_size = get_tensor_model_parallel_world_size() if not disable_tp else 1
-        attn_tp_size = get_attention_tp_world_size(disable_tp)
-        attn_tp_rank = get_attention_tp_rank(disable_tp)
+        # Use prefix-based registry for TPA when prefix is available;
+        # fall back to global attention TP otherwise.
+        if prefix:
+            from vllm.distributed.parallel_state import (
+                get_tp_rank_for_prefix,
+                get_tp_world_size_for_prefix,
+            )
+
+            attn_tp_size = get_tp_world_size_for_prefix(prefix, disable_tp)
+            attn_tp_rank = get_tp_rank_for_prefix(prefix, disable_tp)
+        else:
+            attn_tp_size = get_attention_tp_world_size(disable_tp)
+            attn_tp_rank = get_attention_tp_rank(disable_tp)
         self.num_heads = divide(self.total_num_heads, attn_tp_size)
         if attn_tp_size >= self.total_num_kv_heads:
             self.num_kv_heads = 1
@@ -1014,6 +1025,9 @@ class QKVParallelLinear(ColumnParallelLinear):
         else:
             self.num_kv_heads = divide(self.total_num_kv_heads, attn_tp_size)
             self.num_kv_head_replicas = 1
+        # Expose per-rank head counts for model code.
+        self.num_heads_per_rank = self.num_heads
+        self.num_kv_heads_per_rank = self.num_kv_heads
         # TPA rank for weight loading (may differ from full TP rank).
         self._qkv_tp_rank = attn_tp_rank
         input_size = self.hidden_size
