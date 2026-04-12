@@ -288,6 +288,19 @@ class BatchDCPPrefillWrapper:
         )
         lse_query = lse_query.transpose(0, 1).contiguous()
 
+        # TPA GQA: query self-attention has H_tpa heads but context A2A
+        # reduced to H_tpa/DCP heads. Slice query output to match.
+        from vllm.distributed.parallel_state import is_tpa_gqa_mode
+
+        if is_tpa_gqa_mode():
+            dcp_rank = get_dcp_group().rank_in_group
+            dcp_size = get_dcp_group().world_size
+            heads_per_rank = output_query.shape[1] // dcp_size
+            start = dcp_rank * heads_per_rank
+            end = start + heads_per_rank
+            output_query = output_query[:, start:end, :].contiguous()
+            lse_query = lse_query[:, start:end].contiguous()
+
         merge_attn_states(
             out,
             output_context,
