@@ -50,6 +50,7 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowMLASpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
+    get_kv_cache_spec_dcp_policy,
     get_kv_cache_spec_dcp_world_size,
 )
 from vllm.v1.metrics.stats import CachingMetrics, PrefixCacheStats
@@ -1890,6 +1891,7 @@ def new_deepseek_v4_swa_spec(block_size=64, sliding_window=256):
         cache_dtype_str="fp8_ds_mla",
         alignment=576,
         model_version="deepseek_v4",
+        dcp_shardable=True,
     )
 
 
@@ -2028,7 +2030,28 @@ def test_deepseek_v4_swa_merge_preserves_dcp_metadata():
     assert merged.model_version == "deepseek_v4"
     assert merged.cache_dtype_str == "fp8_ds_mla"
     assert merged.alignment == 576
+    assert merged.dcp_shardable
     assert merged.max_memory_usage_bytes(vllm_config) > 0
+
+
+def test_deepseek_v4_compressor_state_memory_allows_dcp():
+    spec = SlidingWindowMLASpec(
+        block_size=4,
+        num_kv_heads=1,
+        head_size=2304,
+        dtype=torch.float32,
+        sliding_window=8,
+        alignment=576,
+        dcp_shardable=True,
+    )
+    vllm_config = _dcp_block_size_test_config(dcp=2)
+    vllm_config.model_config = SimpleNamespace(max_model_len=1024)
+    vllm_config.scheduler_config = SimpleNamespace(max_num_batched_tokens=128)
+
+    assert not spec.is_deepseek_v4_cache_format
+    assert spec.real_page_size_bytes == 4 * 2304 * 4
+    assert get_kv_cache_spec_dcp_policy(spec) == "sharded"
+    assert spec.max_memory_usage_bytes(vllm_config) > 0
 
 
 def test_deepseek_v4_swa_memory_allows_dcp_from_cache_format():
