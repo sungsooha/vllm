@@ -466,6 +466,10 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
     # Some DeepSeekV4 MLA-adjacent caches, such as compressor states, use the
     # MLA sliding-window scheduler semantics but not the fp8 MLA KV byte layout.
     dcp_shardable: bool = False
+    # Some auxiliary state caches must be visible on every DCP rank even when
+    # real KV caches are sharded. They use context-parallel metadata but keep
+    # the regular non-DCP block table / slot mapping semantics.
+    dcp_transparent: bool = False
 
     def __post_init__(self):
         _apply_alignment_padding(self)
@@ -530,6 +534,7 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
         alignment_set = set(spec.alignment for spec in specs)
         sliding_window_set = set(spec.sliding_window for spec in specs)
         dcp_shardable_set = set(spec.dcp_shardable for spec in specs)
+        dcp_transparent_set = set(spec.dcp_transparent for spec in specs)
         assert (
             len(cache_dtype_str_set) == 1
             and len(compress_ratio_set) == 1
@@ -537,10 +542,11 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
             and len(alignment_set) == 1
             and len(sliding_window_set) == 1
             and len(dcp_shardable_set) == 1
+            and len(dcp_transparent_set) == 1
         ), (
             "All attention layers in the same KV cache group must use the same "
             "quantization method, compress ratio, model version, alignment, "
-            "sliding window size, and DCP sharding policy."
+            "sliding window size, and DCP policy."
         )
         return cls(
             block_size=specs[0].block_size,
@@ -554,6 +560,7 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
             compress_ratio=compress_ratio_set.pop(),
             model_version=model_version_set.pop(),
             dcp_shardable=dcp_shardable_set.pop(),
+            dcp_transparent=dcp_transparent_set.pop(),
         )
 
 
@@ -828,6 +835,8 @@ def get_kv_cache_spec_dcp_policy(spec: KVCacheSpec) -> KVCacheDCPPolicy:
         return "transparent"
 
     if isinstance(spec, SlidingWindowMLASpec):
+        if spec.dcp_transparent:
+            return "transparent"
         return "sharded" if spec.supports_dcp_sharding else "unsupported"
 
     if isinstance(spec, SlidingWindowSpec):
