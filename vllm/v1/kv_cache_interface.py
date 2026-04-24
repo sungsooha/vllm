@@ -420,6 +420,15 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
         )
 
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
+        if self.dcp_transparent:
+            max_model_len = vllm_config.model_config.max_model_len
+            max_num_batched_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+            num_tokens = min(
+                self.sliding_window - 1 + max_num_batched_tokens,
+                max_model_len,
+            )
+            return (cdiv(num_tokens, self.block_size) + 1) * self.page_size_bytes
+
         if not self.supports_dcp_sharding:
             return super().max_memory_usage_bytes(vllm_config)
 
