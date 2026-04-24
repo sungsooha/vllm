@@ -40,7 +40,11 @@ from vllm.config import (
     VllmConfig,
     get_current_vllm_config,
 )
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import (
+    get_dcp_group,
+    get_pcp_group,
+    get_tensor_model_parallel_world_size,
+)
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import PluggableLayer
@@ -59,6 +63,7 @@ from vllm.utils.multi_stream_utils import (
     maybe_execute_in_parallel,
 )
 from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata
+from vllm.v1.attention.backends.mla.compressor_utils import get_cp_local_seq_lens
 from vllm.v1.attention.backends.mla.flashmla_sparse import (
     DeepseekV4FlashMLASparseBackend,
     FlashMLASparseBackend,
@@ -665,6 +670,23 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             vllm_config.scheduler_config.max_num_batched_tokens
         )
         self.max_model_len = vllm_config.model_config.max_model_len
+        try:
+            dcp_world_size = get_dcp_group().world_size
+            dcp_rank = get_dcp_group().rank_in_group
+        except AssertionError:
+            dcp_world_size = 1
+            dcp_rank = 0
+        try:
+            pcp_world_size = get_pcp_group().world_size
+            pcp_rank = get_pcp_group().rank_in_group
+        except AssertionError:
+            pcp_world_size = 1
+            pcp_rank = 0
+        self.total_cp_world_size = pcp_world_size * dcp_world_size
+        self.total_cp_rank = pcp_rank * dcp_world_size + dcp_rank
+        self.cp_kv_cache_interleave_size = (
+            vllm_config.parallel_config.cp_kv_cache_interleave_size
+        )
         # DeepseekV4 only supports fp8 kv-cache format for now
         kv_cache_dtype = cache_config.cache_dtype if cache_config is not None else "fp8"
 
@@ -886,9 +908,11 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
 
         # Use pre-computed prefill metadata.
         seq_lens = swa_metadata.prefill_seq_lens
-        gather_lens = swa_metadata.prefill_gather_lens
+        swa_seq_lens = swa_metadata.prefill_swa_seq_lens
+        swa_gather_lens = swa_metadata.prefill_gather_lens
         assert seq_lens is not None
-        assert gather_lens is not None
+        assert swa_seq_lens is not None
+        assert swa_gather_lens is not None
 
         # Derive prefill-local token offsets from the full query_start_loc_cpu.
         query_start_loc_cpu = swa_metadata.query_start_loc_cpu
@@ -933,10 +957,16 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 # Gather compressed KV
                 assert attn_metadata is not None
                 block_table = attn_metadata.block_table[num_decodes:]
+                compressed_seq_lens = get_cp_local_seq_lens(
+                    seq_lens[chunk_start:chunk_end] // self.compress_ratio,
+                    self.total_cp_world_size,
+                    self.total_cp_rank,
+                    self.cp_kv_cache_interleave_size,
+                )
                 dequantize_and_gather_k_cache(
                     kv[:chunk_size],
                     compressed_k_cache,
-                    seq_lens=seq_lens[chunk_start:chunk_end] // self.compress_ratio,
+                    seq_lens=compressed_seq_lens,
                     gather_lens=None,
                     block_table=block_table[chunk_start:chunk_end],
                     block_size=attn_metadata.block_size // self.compress_ratio,
@@ -948,8 +978,8 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             dequantize_and_gather_k_cache(
                 kv[:chunk_size],
                 swa_k_cache,
-                seq_lens=seq_lens[chunk_start:chunk_end],
-                gather_lens=gather_lens[chunk_start:chunk_end],
+                seq_lens=swa_seq_lens[chunk_start:chunk_end],
+                gather_lens=swa_gather_lens[chunk_start:chunk_end],
                 block_table=swa_block_table[chunk_start:chunk_end],
                 block_size=swa_metadata.block_size,
                 offset=N,
@@ -969,12 +999,15 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                     num_decodes + chunk_start : num_decodes + chunk_end + 1
                 ],
                 seq_lens[chunk_start:chunk_end],
-                gather_lens[chunk_start:chunk_end],
+                swa_gather_lens[chunk_start:chunk_end],
                 self.window_size,
                 self.compress_ratio,
                 top_k,
                 M,
                 N,
+                total_cp_world_size=self.total_cp_world_size,
+                total_cp_rank=self.total_cp_rank,
+                cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
             )
 
             output_chunk, _, _ = flash_mla_sparse_fwd(

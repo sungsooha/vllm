@@ -6,6 +6,7 @@ import torch
 
 import vllm.envs as envs
 from vllm.config import VllmConfig
+from vllm.distributed import get_dcp_group, get_pcp_group
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
@@ -22,7 +23,10 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
     MultipleOf,
 )
-from vllm.v1.attention.backends.mla.compressor_utils import get_compressed_slot_mapping
+from vllm.v1.attention.backends.mla.compressor_utils import (
+    get_compressed_slot_mapping,
+    get_cp_local_seq_lens,
+)
 from vllm.v1.attention.backends.utils import (
     split_decodes_and_prefills,
 )
@@ -245,6 +249,23 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         scheduler_config = self.vllm_config.scheduler_config
+        try:
+            dcp_world_size = get_dcp_group().world_size
+            dcp_rank = get_dcp_group().rank_in_group
+        except AssertionError:
+            dcp_world_size = 1
+            dcp_rank = 0
+        try:
+            pcp_world_size = get_pcp_group().world_size
+            pcp_rank = get_pcp_group().rank_in_group
+        except AssertionError:
+            pcp_world_size = 1
+            pcp_rank = 0
+        self.total_cp_world_size = pcp_world_size * dcp_world_size
+        self.total_cp_rank = pcp_rank * dcp_world_size + dcp_rank
+        self.cp_kv_cache_interleave_size = (
+            self.vllm_config.parallel_config.cp_kv_cache_interleave_size
+        )
         # NOTE(Chen):an estimated max size of flattened_kv. Need to double check.
         self.max_prefill_buffer_size = get_max_prefill_buffer_size(self.vllm_config)
         self.num_speculative_tokens = (
@@ -499,8 +520,17 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 self.kv_cache_spec.storage_block_size,
                 self.compress_ratio,
                 out=self.compressed_slot_mapping_buffer,
+                total_cp_world_size=self.total_cp_world_size,
+                total_cp_rank=self.total_cp_rank,
+                cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
             )
             compressed_seq_lens = seq_lens // self.compress_ratio
+            compressed_seq_lens = get_cp_local_seq_lens(
+                compressed_seq_lens,
+                self.total_cp_world_size,
+                self.total_cp_rank,
+                self.cp_kv_cache_interleave_size,
+            )
 
         prefill_metadata = None
         if num_prefills > 0:
@@ -510,7 +540,12 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             assert common_attn_metadata.seq_lens_cpu_upper_bound is not None
             seq_lens_cpu = common_attn_metadata.seq_lens_cpu_upper_bound
             compressed_seq_lens_cpu = (
-                seq_lens_cpu // self.compress_ratio
+                get_cp_local_seq_lens(
+                    seq_lens_cpu // self.compress_ratio,
+                    self.total_cp_world_size,
+                    self.total_cp_rank,
+                    self.cp_kv_cache_interleave_size,
+                )
                 if self.compress_ratio > 1
                 else seq_lens_cpu
             )
@@ -544,6 +579,9 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                     self.compress_ratio,
                     query_slice=query_slice,
                     skip_kv_gather=query_slice.start > 0,
+                    total_cp_world_size=self.total_cp_world_size,
+                    total_cp_rank=self.total_cp_rank,
+                    cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
                 )
                 # Skip when total_seq_lens is 0 (i.e., no compressed token).
                 if metadata is not None:
@@ -593,10 +631,24 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 )
                 if seq_lens_is_local_view:
                     seq_lens //= self.compress_ratio
+                    seq_lens.copy_(
+                        get_cp_local_seq_lens(
+                            seq_lens,
+                            self.total_cp_world_size,
+                            self.total_cp_rank,
+                            self.cp_kv_cache_interleave_size,
+                        )
+                    )
                 else:
                     # Copy to avoid mutating shared state; keeps CG address stable.
                     self.expanded_seq_lens_buffer[:num_decodes] = (
                         seq_lens // self.compress_ratio
+                    )
+                    self.expanded_seq_lens_buffer[:num_decodes] = get_cp_local_seq_lens(
+                        self.expanded_seq_lens_buffer[:num_decodes],
+                        self.total_cp_world_size,
+                        self.total_cp_rank,
+                        self.cp_kv_cache_interleave_size,
                     )
                     self.expanded_seq_lens_buffer[num_decodes:num_decode_tokens] = 0
                     seq_lens = self.expanded_seq_lens_buffer[:num_decode_tokens]
@@ -650,6 +702,9 @@ def build_prefill_chunk_metadata(
     compress_ratio: int,
     query_slice: slice | None = None,
     skip_kv_gather: bool = False,
+    total_cp_world_size: int = 1,
+    total_cp_rank: int = 0,
+    cp_kv_cache_interleave_size: int = 1,
 ) -> DeepseekV32IndexerPrefillChunkMetadata | None:
     total_seq_lens = compressed_seq_lens_cpu[start_idx:end_idx].sum().item()
     if total_seq_lens == 0:
@@ -693,6 +748,9 @@ def build_prefill_chunk_metadata(
         qs_stop,
         BLOCK_SIZE=1024,
         COMPRESS_RATIO=compress_ratio,
+        TOTAL_CP_WORLD_SIZE=total_cp_world_size,
+        TOTAL_CP_RANK=total_cp_rank,
+        CP_KV_CACHE_INTERLEAVE_SIZE=cp_kv_cache_interleave_size,
     )
 
     token_start = query_start_loc_cpu[start_idx].item()
@@ -718,6 +776,27 @@ def build_prefill_chunk_metadata(
 
 
 @triton.jit
+def _cp_local_token_count(
+    length,
+    TOTAL_CP_WORLD_SIZE: tl.constexpr,
+    TOTAL_CP_RANK: tl.constexpr,
+    CP_KV_CACHE_INTERLEAVE_SIZE: tl.constexpr,
+):
+    base = (
+        length
+        // CP_KV_CACHE_INTERLEAVE_SIZE
+        // TOTAL_CP_WORLD_SIZE
+        * CP_KV_CACHE_INTERLEAVE_SIZE
+    )
+    remainder = length - base * TOTAL_CP_WORLD_SIZE
+    extra = tl.minimum(
+        tl.maximum(remainder - TOTAL_CP_RANK * CP_KV_CACHE_INTERLEAVE_SIZE, 0),
+        CP_KV_CACHE_INTERLEAVE_SIZE,
+    )
+    return base + extra
+
+
+@triton.jit
 def _build_prefill_chunk_metadata_kernel(
     # Inputs
     query_start_loc_ptr,
@@ -731,6 +810,9 @@ def _build_prefill_chunk_metadata_kernel(
     query_slice_stop,
     BLOCK_SIZE: tl.constexpr,
     COMPRESS_RATIO: tl.constexpr,
+    TOTAL_CP_WORLD_SIZE: tl.constexpr,
+    TOTAL_CP_RANK: tl.constexpr,
+    CP_KV_CACHE_INTERLEAVE_SIZE: tl.constexpr,
 ):
     batch_idx = tl.program_id(0)
 
@@ -759,7 +841,12 @@ def _build_prefill_chunk_metadata_kernel(
         tl.store(cu_compressed_seq_len_ks_ptr + out_pos, seq_start, mask=mask)
 
         # Compute cu_seq_len_ke
-        seq_len_per_token = (start_pos + 1 + offset) // COMPRESS_RATIO
+        seq_len_per_token = _cp_local_token_count(
+            (start_pos + 1 + offset) // COMPRESS_RATIO,
+            TOTAL_CP_WORLD_SIZE,
+            TOTAL_CP_RANK,
+            CP_KV_CACHE_INTERLEAVE_SIZE,
+        )
         tl.store(
             cu_compressed_seq_len_ke_ptr + out_pos,
             seq_start + seq_len_per_token,

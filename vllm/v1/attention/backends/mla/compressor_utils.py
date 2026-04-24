@@ -5,6 +5,31 @@ import torch
 from vllm.triton_utils import tl, triton
 
 
+def get_cp_local_seq_lens(
+    seq_lens: torch.Tensor,
+    total_cp_world_size: int = 1,
+    total_cp_rank: int = 0,
+    cp_kv_cache_interleave_size: int = 1,
+) -> torch.Tensor:
+    seq_lens = seq_lens.to(torch.int32)
+    if total_cp_world_size == 1:
+        return seq_lens
+
+    base = (
+        seq_lens
+        // cp_kv_cache_interleave_size
+        // total_cp_world_size
+        * cp_kv_cache_interleave_size
+    )
+    remainder = seq_lens - base * total_cp_world_size
+    extra = torch.clamp(
+        remainder - total_cp_rank * cp_kv_cache_interleave_size,
+        0,
+        cp_kv_cache_interleave_size,
+    )
+    return base + extra
+
+
 @triton.jit
 def _compressed_slot_mapping_kernel(
     # [num_tokens]
@@ -19,6 +44,9 @@ def _compressed_slot_mapping_kernel(
     block_size,
     COMPRESS_RATIO: tl.constexpr,
     PAD_ID: tl.constexpr,
+    TOTAL_CP_WORLD_SIZE: tl.constexpr,
+    TOTAL_CP_RANK: tl.constexpr,
+    CP_KV_CACHE_INTERLEAVE_SIZE: tl.constexpr,
     TRITON_BLOCK_SIZE: tl.constexpr,
 ):
     batch_idx = tl.program_id(0)
@@ -38,15 +66,25 @@ def _compressed_slot_mapping_kernel(
         is_valid = (pos + 1) % COMPRESS_RATIO == 0
         pos_after_compress = pos // COMPRESS_RATIO
 
-        block_ids = pos_after_compress // block_size
+        virtual_block_size = block_size * TOTAL_CP_WORLD_SIZE
+        block_ids = pos_after_compress // virtual_block_size
         block_numbers = tl.load(
             block_table_ptr + batch_idx * block_table_stride + block_ids,
             mask=mask & is_valid,
         )
-        slot_ids = block_numbers * block_size + pos_after_compress % block_size
+        virtual_block_offsets = pos_after_compress - block_ids * virtual_block_size
+        is_local = (
+            virtual_block_offsets // CP_KV_CACHE_INTERLEAVE_SIZE
+        ) % TOTAL_CP_WORLD_SIZE == TOTAL_CP_RANK
+        local_block_offsets = (
+            virtual_block_offsets // (TOTAL_CP_WORLD_SIZE * CP_KV_CACHE_INTERLEAVE_SIZE)
+        ) * CP_KV_CACHE_INTERLEAVE_SIZE + (
+            virtual_block_offsets % CP_KV_CACHE_INTERLEAVE_SIZE
+        )
+        slot_ids = block_numbers * block_size + local_block_offsets
 
         # NOTE
-        slot_ids = tl.where(is_valid, slot_ids, PAD_ID)
+        slot_ids = tl.where(is_valid & is_local, slot_ids, PAD_ID)
         tl.store(slot_mapping_ptr + query_start + offset, slot_ids, mask=mask)
 
 
@@ -58,6 +96,9 @@ def get_compressed_slot_mapping(
     block_size: int,
     compress_ratio: int,
     out: torch.Tensor | None = None,
+    total_cp_world_size: int = 1,
+    total_cp_rank: int = 0,
+    cp_kv_cache_interleave_size: int = 1,
 ) -> torch.Tensor:
     if out is not None:
         # Guard: for padded / invalid sequences.
@@ -81,6 +122,9 @@ def get_compressed_slot_mapping(
         block_size,
         compress_ratio,
         PAD_ID=-1,
+        TOTAL_CP_WORLD_SIZE=total_cp_world_size,
+        TOTAL_CP_RANK=total_cp_rank,
+        CP_KV_CACHE_INTERLEAVE_SIZE=cp_kv_cache_interleave_size,
         TRITON_BLOCK_SIZE=1024,
     )
     return slot_mapping
