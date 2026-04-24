@@ -2018,6 +2018,36 @@ def test_deepseek_v4_swa_memory_allows_dcp():
     assert spec.max_memory_usage_bytes(vllm_config) > 0
 
 
+def test_deepseek_v4_swa_merge_preserves_dcp_metadata():
+    spec = new_deepseek_v4_swa_spec(block_size=64, sliding_window=256)
+    merged = SlidingWindowMLASpec.merge([spec, spec])
+    vllm_config = _dcp_block_size_test_config(dcp=2)
+    vllm_config.model_config = SimpleNamespace(max_model_len=1024)
+    vllm_config.scheduler_config = SimpleNamespace(max_num_batched_tokens=128)
+
+    assert merged.model_version == "deepseek_v4"
+    assert merged.cache_dtype_str == "fp8_ds_mla"
+    assert merged.alignment == 576
+    assert merged.max_memory_usage_bytes(vllm_config) > 0
+
+
+def test_deepseek_v4_swa_memory_allows_dcp_from_cache_format():
+    spec = SlidingWindowMLASpec(
+        block_size=64,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.uint8,
+        sliding_window=256,
+        cache_dtype_str="fp8_ds_mla",
+        alignment=576,
+    )
+    vllm_config = _dcp_block_size_test_config(dcp=2)
+    vllm_config.model_config = SimpleNamespace(max_model_len=1024)
+    vllm_config.scheduler_config = SimpleNamespace(max_num_batched_tokens=128)
+
+    assert spec.max_memory_usage_bytes(vllm_config) > 0
+
+
 @pytest.mark.parametrize("hash_fn", [sha256, sha256_cbor])
 def test_request_block_hasher_with_prompt_embeds(hash_fn: Callable[[Any], bytes]):
     block_size = 3

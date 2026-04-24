@@ -468,12 +468,18 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
         _apply_alignment_padding(self)
 
     @property
+    def is_deepseek_v4_cache_format(self) -> bool:
+        return (
+            self.model_version == "deepseek_v4" or self.cache_dtype_str == "fp8_ds_mla"
+        )
+
+    @property
     def storage_block_size(self) -> int:
         return self.block_size // self.compress_ratio
 
     @property
     def real_page_size_bytes(self) -> int:
-        if self.model_version == "deepseek_v4":
+        if self.is_deepseek_v4_cache_format:
             # DeepseekV4: 448B NoPE + 128B RoPE + 8B fp8 scale = 584B per token.
             return self.storage_block_size * 584
         assert self.model_version is None, (
@@ -487,7 +493,7 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
         )
 
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
-        if self.model_version != "deepseek_v4":
+        if not self.is_deepseek_v4_cache_format:
             return super().max_memory_usage_bytes(vllm_config)
 
         max_model_len = vllm_config.model_config.max_model_len
@@ -514,16 +520,18 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
         cache_dtype_str_set = set(spec.cache_dtype_str for spec in specs)
         compress_ratio_set = set(spec.compress_ratio for spec in specs)
         model_version_set = set(spec.model_version for spec in specs)
+        alignment_set = set(spec.alignment for spec in specs)
         sliding_window_set = set(spec.sliding_window for spec in specs)
         assert (
             len(cache_dtype_str_set) == 1
             and len(compress_ratio_set) == 1
             and len(model_version_set) == 1
+            and len(alignment_set) == 1
             and len(sliding_window_set) == 1
         ), (
             "All attention layers in the same KV cache group must use the same "
-            "quantization method, compress ratio, model version and sliding "
-            "window size."
+            "quantization method, compress ratio, model version, alignment, "
+            "and sliding window size."
         )
         return cls(
             block_size=specs[0].block_size,
@@ -533,6 +541,7 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
             page_size_padded=specs[0].page_size_padded,
             sliding_window=sliding_window_set.pop(),
             cache_dtype_str=cache_dtype_str_set.pop(),
+            alignment=alignment_set.pop(),
             compress_ratio=compress_ratio_set.pop(),
             model_version=model_version_set.pop(),
         )
@@ -809,7 +818,7 @@ def get_kv_cache_spec_dcp_policy(spec: KVCacheSpec) -> KVCacheDCPPolicy:
         return "transparent"
 
     if isinstance(spec, SlidingWindowMLASpec):
-        return "sharded" if spec.model_version == "deepseek_v4" else "unsupported"
+        return "sharded" if spec.is_deepseek_v4_cache_format else "unsupported"
 
     if isinstance(spec, SlidingWindowSpec):
         return "unsupported"
