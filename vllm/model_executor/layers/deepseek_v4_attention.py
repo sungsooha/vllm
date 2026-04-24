@@ -903,7 +903,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         output: torch.Tensor,
         padded_local_heads: int,
     ) -> None:
-        combined_out, _ = self.dcp_combine(
+        combined_out, combined_lse = self.dcp_combine(
             partial_out,
             partial_lse,
             get_dcp_group(),
@@ -914,6 +914,15 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             padded_local_heads,
             self.head_dim,
         ), f"unexpected DCP-combined output shape {tuple(combined_out.shape)}"
+        assert combined_lse.shape == (
+            output.shape[0],
+            padded_local_heads,
+        ), f"unexpected DCP-combined LSE shape {tuple(combined_lse.shape)}"
+        # FlashMLA sink scaling does not affect returned LSE, so under DCP it
+        # must be applied once after the global LSE is known.
+        sink = self.attn_sink[:padded_local_heads].to(combined_lse.dtype)
+        sink_scale = torch.sigmoid(combined_lse - sink.unsqueeze(0))
+        combined_out = combined_out * sink_scale.unsqueeze(-1).to(combined_out.dtype)
         output[:, :padded_local_heads, :].copy_(combined_out)
 
     def _forward_decode(
