@@ -14,6 +14,7 @@ from pydantic import ValidationError
 import vllm.config.vllm as vllm_config_module
 from vllm.compilation.backends import VllmBackend
 from vllm.config import (
+    CacheConfig,
     CompilationConfig,
     KernelConfig,
     ModelConfig,
@@ -122,6 +123,59 @@ def test_with_hf_config_leaves_unknown_model_type_without_architectures(
     updated = VllmConfig.with_hf_config(cfg, hf_config)
 
     assert updated.model_config.hf_config.architectures is None
+
+
+def _deepseek_v4_dcp_test_config(enforce_eager: bool = True) -> VllmConfig:
+    cfg = VllmConfig()
+    cfg.model_config = SimpleNamespace(
+        architecture="DeepseekV4ForCausalLM",
+        hf_config=SimpleNamespace(model_type="deepseek_v4"),
+        hf_text_config=SimpleNamespace(model_type="deepseek_v4"),
+        enforce_eager=enforce_eager,
+    )
+    cfg.parallel_config = ParallelConfig(
+        tensor_parallel_size=2,
+        decode_context_parallel_size=2,
+        dcp_comm_backend="a2a",
+    )
+    cfg.cache_config = CacheConfig(enable_prefix_caching=False)
+    cfg.compilation_config = CompilationConfig(cudagraph_mode=CUDAGraphMode.NONE)
+    return cfg
+
+
+def test_deepseek_v4_dcp_guard_requires_feature_flag(monkeypatch):
+    monkeypatch.delenv("VLLM_ENABLE_DEEPSEEK_V4_DCP", raising=False)
+    cfg = _deepseek_v4_dcp_test_config()
+
+    with pytest.raises(ValueError, match="VLLM_ENABLE_DEEPSEEK_V4_DCP"):
+        cfg._validate_deepseek_v4_dcp()
+
+
+def test_deepseek_v4_dcp_guard_rejects_unsupported_mvp_options(monkeypatch):
+    monkeypatch.setenv("VLLM_ENABLE_DEEPSEEK_V4_DCP", "1")
+    cfg = _deepseek_v4_dcp_test_config(enforce_eager=False)
+    cfg.parallel_config = ParallelConfig(
+        tensor_parallel_size=2,
+        decode_context_parallel_size=2,
+        dcp_comm_backend="ag_rs",
+    )
+    cfg.cache_config.enable_prefix_caching = True
+    cfg.compilation_config.cudagraph_mode = CUDAGraphMode.FULL
+
+    with pytest.raises(ValueError) as exc_info:
+        cfg._validate_deepseek_v4_dcp()
+
+    message = str(exc_info.value)
+    assert "dcp_comm_backend must be 'a2a'" in message
+    assert "prefix caching must be disabled" in message
+    assert "CUDA graphs must be explicitly disabled" in message
+
+
+def test_deepseek_v4_dcp_guard_allows_explicit_mvp_config(monkeypatch):
+    monkeypatch.setenv("VLLM_ENABLE_DEEPSEEK_V4_DCP", "1")
+    cfg = _deepseek_v4_dcp_test_config()
+
+    cfg._validate_deepseek_v4_dcp()
 
 
 def test_async_scheduling_with_pipeline_parallelism_is_allowed():

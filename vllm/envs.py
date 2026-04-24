@@ -91,6 +91,7 @@ if TYPE_CHECKING:
     CMAKE_BUILD_TYPE: Literal["Debug", "Release", "RelWithDebInfo"] | None = None
     VERBOSE: bool = False
     VLLM_ALLOW_LONG_MAX_MODEL_LEN: bool = False
+    VLLM_ENABLE_DEEPSEEK_V4_DCP: bool = False
     VLLM_RPC_TIMEOUT: int = 10000  # ms
     VLLM_HTTP_TIMEOUT_KEEP_ALIVE: int = 5  # seconds
     VLLM_MAX_N_SEQUENCES: int = 16384
@@ -905,6 +906,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # To enable this, set VLLM_ALLOW_LONG_MAX_MODEL_LEN=1.
     "VLLM_ALLOW_LONG_MAX_MODEL_LEN": lambda: (
         os.environ.get("VLLM_ALLOW_LONG_MAX_MODEL_LEN", "0").strip().lower()
+        in ("1", "true")
+    ),
+    # Experimental guard for DeepSeek V4 decode context parallelism. This must
+    # stay opt-in until the V4-specific KV-cache and attention paths are DCP-safe.
+    "VLLM_ENABLE_DEEPSEEK_V4_DCP": lambda: (
+        os.environ.get("VLLM_ENABLE_DEEPSEEK_V4_DCP", "0").strip().lower()
         in ("1", "true")
     ),
     # If set, forces FP8 Marlin to be used for FP8 quantization regardless
