@@ -463,6 +463,9 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
     alignment: int | None = None  # Default to None for no padding.
     compress_ratio: int = 1
     model_version: str | None = None
+    # Some DeepSeekV4 MLA-adjacent caches, such as compressor states, use the
+    # MLA sliding-window scheduler semantics but not the fp8 MLA KV byte layout.
+    dcp_shardable: bool = False
 
     def __post_init__(self):
         _apply_alignment_padding(self)
@@ -472,6 +475,10 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
         return (
             self.model_version == "deepseek_v4" or self.cache_dtype_str == "fp8_ds_mla"
         )
+
+    @property
+    def supports_dcp_sharding(self) -> bool:
+        return self.dcp_shardable or self.is_deepseek_v4_cache_format
 
     @property
     def storage_block_size(self) -> int:
@@ -493,7 +500,7 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
         )
 
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
-        if not self.is_deepseek_v4_cache_format:
+        if not self.supports_dcp_sharding:
             return super().max_memory_usage_bytes(vllm_config)
 
         max_model_len = vllm_config.model_config.max_model_len
@@ -522,16 +529,18 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
         model_version_set = set(spec.model_version for spec in specs)
         alignment_set = set(spec.alignment for spec in specs)
         sliding_window_set = set(spec.sliding_window for spec in specs)
+        dcp_shardable_set = set(spec.dcp_shardable for spec in specs)
         assert (
             len(cache_dtype_str_set) == 1
             and len(compress_ratio_set) == 1
             and len(model_version_set) == 1
             and len(alignment_set) == 1
             and len(sliding_window_set) == 1
+            and len(dcp_shardable_set) == 1
         ), (
             "All attention layers in the same KV cache group must use the same "
             "quantization method, compress ratio, model version, alignment, "
-            "and sliding window size."
+            "sliding window size, and DCP sharding policy."
         )
         return cls(
             block_size=specs[0].block_size,
@@ -544,6 +553,7 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
             alignment=alignment_set.pop(),
             compress_ratio=compress_ratio_set.pop(),
             model_version=model_version_set.pop(),
+            dcp_shardable=dcp_shardable_set.pop(),
         )
 
 
@@ -818,7 +828,7 @@ def get_kv_cache_spec_dcp_policy(spec: KVCacheSpec) -> KVCacheDCPPolicy:
         return "transparent"
 
     if isinstance(spec, SlidingWindowMLASpec):
-        return "sharded" if spec.is_deepseek_v4_cache_format else "unsupported"
+        return "sharded" if spec.supports_dcp_sharding else "unsupported"
 
     if isinstance(spec, SlidingWindowSpec):
         return "unsupported"
