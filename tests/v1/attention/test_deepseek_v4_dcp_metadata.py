@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -162,4 +164,30 @@ def test_deepseek_v4_compressor_state_cache_is_dcp_transparent():
             pcp_world_size=1,
         )
         == 4
+    )
+
+
+def test_deepseek_v4_compressor_state_cache_sizes_with_dcp_enabled():
+    spec = SlidingWindowMLASpec(
+        block_size=4,
+        num_kv_heads=1,
+        head_size=2048,
+        dtype=torch.float32,
+        sliding_window=8,
+        alignment=576,
+        dcp_transparent=True,
+    )
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=1024),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=64),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=4,
+            prefill_context_parallel_size=1,
+        ),
+    )
+
+    expected_pages = 19  # ceil((8 - 1 + 64) / 4) + one sliding offset page.
+    assert (
+        spec.max_memory_usage_bytes(vllm_config)
+        == expected_pages * spec.page_size_bytes
     )
