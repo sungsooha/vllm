@@ -1,6 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import pytest
+import torch
+
+from vllm.model_executor.layers.deepseek_v4_attention import (
+    _apply_attn_sink_with_lse,
+    _get_dcp_padded_head_counts,
+)
+
 
 def _owner(pos: int, cp_world_size: int, interleave: int) -> int:
     return (pos % (cp_world_size * interleave)) // interleave
@@ -58,3 +66,53 @@ def test_deepseek_v4_cp_local_count_matches_enumeration():
                     if _owner(pos, cp_world_size, interleave) == rank
                 )
                 assert _local_count(length, cp_world_size, rank, interleave) == expected
+
+
+@pytest.mark.parametrize(
+    ("local_heads", "dcp_world_size", "expected"),
+    [
+        (32, 4, (32, 128)),
+        (16, 4, (16, 64)),
+        (8, 4, (16, 64)),
+        (16, 2, (32, 64)),
+        (32, 2, (32, 64)),
+        (64, 2, (64, 128)),
+    ],
+)
+def test_deepseek_v4_dcp_flashmla_head_padding(
+    local_heads: int,
+    dcp_world_size: int,
+    expected: tuple[int, int],
+):
+    padded_local_heads, padded_global_heads = _get_dcp_padded_head_counts(
+        local_heads,
+        dcp_world_size,
+    )
+
+    assert (padded_local_heads, padded_global_heads) == expected
+    assert padded_global_heads in (64, 128)
+    assert padded_global_heads == padded_local_heads * dcp_world_size
+    assert local_heads <= padded_local_heads
+
+
+def test_deepseek_v4_dcp_flashmla_head_padding_rejects_unsupported():
+    with pytest.raises(ValueError, match="supported head count"):
+        _get_dcp_padded_head_counts(local_heads=65, dcp_world_size=2)
+
+
+def test_deepseek_v4_dcp_attn_sink_uses_global_lse_once():
+    output = torch.ones((2, 3, 4), dtype=torch.float32)
+    global_lse = torch.tensor(
+        [
+            [0.0, 1.0, 2.0],
+            [3.0, 4.0, 5.0],
+        ],
+        dtype=torch.float32,
+    )
+    attn_sink = torch.tensor([0.0, 2.0, -float("inf")], dtype=torch.float32)
+
+    actual = _apply_attn_sink_with_lse(output, global_lse, attn_sink)
+    expected_scale = torch.sigmoid(global_lse - attn_sink.unsqueeze(0))
+
+    torch.testing.assert_close(actual, output * expected_scale.unsqueeze(-1))
+    torch.testing.assert_close(actual[:, 2], output[:, 2])

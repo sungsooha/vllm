@@ -111,6 +111,16 @@ def _get_dcp_padded_head_counts(
     )
 
 
+def _apply_attn_sink_with_lse(
+    output: torch.Tensor,
+    global_lse: torch.Tensor,
+    attn_sink: torch.Tensor,
+) -> torch.Tensor:
+    sink = attn_sink[: global_lse.shape[1]].to(global_lse.dtype)
+    sink_scale = torch.sigmoid(global_lse - sink.unsqueeze(0))
+    return output * sink_scale.unsqueeze(-1).to(output.dtype)
+
+
 @dataclass
 class DeepseekV4MLAModules:
     """Modules used in DeepseekV4 MLA."""
@@ -920,9 +930,11 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         ), f"unexpected DCP-combined LSE shape {tuple(combined_lse.shape)}"
         # FlashMLA sink scaling does not affect returned LSE, so under DCP it
         # must be applied once after the global LSE is known.
-        sink = self.attn_sink[:padded_local_heads].to(combined_lse.dtype)
-        sink_scale = torch.sigmoid(combined_lse - sink.unsqueeze(0))
-        combined_out = combined_out * sink_scale.unsqueeze(-1).to(combined_out.dtype)
+        combined_out = _apply_attn_sink_with_lse(
+            combined_out,
+            combined_lse,
+            self.attn_sink[:padded_local_heads],
+        )
         output[:, :padded_local_heads, :].copy_(combined_out)
 
     def _forward_decode(
