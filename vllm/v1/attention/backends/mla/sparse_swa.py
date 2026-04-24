@@ -6,6 +6,7 @@ from typing import ClassVar, cast
 import torch
 
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
+from vllm.distributed import get_dcp_group, get_pcp_group
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backend import (
@@ -159,7 +160,10 @@ class DeepseekSparseSWAMetadata:
     num_prefill_tokens: int = 0
 
     # Pre-computed prefill metadata shared across all DeepseekV4 attention layers.
+    # `prefill_seq_lens` remains the global sequence length because compressed
+    # layers need it to derive their own compressed local lengths.
     prefill_seq_lens: torch.Tensor | None = None
+    prefill_swa_seq_lens: torch.Tensor | None = None
     prefill_gather_lens: torch.Tensor | None = None
 
     # Per-layer-type FlashMLA tile-scheduler metadata. One FlashMLASchedMeta
@@ -201,6 +205,23 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         self.head_size = mla_spec.head_size  # Already considered quantization.
         self.compress_ratio = mla_spec.compress_ratio
         self.block_size = mla_spec.block_size
+        try:
+            dcp_world_size = get_dcp_group().world_size
+            dcp_rank = get_dcp_group().rank_in_group
+        except AssertionError:
+            dcp_world_size = 1
+            dcp_rank = 0
+        try:
+            pcp_world_size = get_pcp_group().world_size
+            pcp_rank = get_pcp_group().rank_in_group
+        except AssertionError:
+            pcp_world_size = 1
+            pcp_rank = 0
+        self.total_cp_world_size = pcp_world_size * dcp_world_size
+        self.total_cp_rank = pcp_rank * dcp_world_size + dcp_rank
+        self.cp_kv_cache_interleave_size = (
+            self.vllm_config.parallel_config.cp_kv_cache_interleave_size
+        )
 
         # Handle MTP: adjust decode_threshold like the indexer does
         self.num_speculative_tokens = (
@@ -252,6 +273,11 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             dtype=torch.bool,
             device=self.device,
         )
+        self.token_arange = torch.arange(
+            max_tokens,
+            dtype=torch.int32,
+            device=self.device,
+        )
 
     def build(
         self,
@@ -289,7 +315,13 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         token_to_req_indices.copy_(x, non_blocking=True)
 
         is_valid_token = self.is_valid_token[: slot_mapping.shape[0]]
-        is_valid_token.copy_(slot_mapping >= 0)
+        # Under DCP, slot_mapping < 0 only means this rank does not own the KV
+        # slot for that token. The query token is still valid and must produce a
+        # local partial attention result for the LSE combine.
+        is_valid_token.copy_(
+            self.token_arange[: slot_mapping.shape[0]]
+            < common_attn_metadata.num_actual_tokens
+        )
 
         if num_decode_tokens > 0:
             self.decode_swa_lens[num_decode_tokens:] = 0
@@ -305,6 +337,9 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
                 block_table,
                 block_table.stride(0),
                 self.block_size,
+                TOTAL_CP_WORLD_SIZE=self.total_cp_world_size,
+                TOTAL_CP_RANK=self.total_cp_rank,
+                CP_KV_CACHE_INTERLEAVE_SIZE=self.cp_kv_cache_interleave_size,
                 TRITON_BLOCK_SIZE=1024,
             )
 
@@ -394,25 +429,55 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             pfx_gather_lens = torch.empty(
                 num_prefills, dtype=torch.int32, device=seq_lens.device
             )
+            pfx_swa_seq_lens = torch.empty(
+                num_prefills, dtype=torch.int32, device=seq_lens.device
+            )
             _compute_prefill_metadata_kernel[(1,)](
+                pfx_swa_seq_lens,
                 pfx_gather_lens,
                 seq_lens,
                 query_start_loc,
                 num_prefills,
                 num_decodes,
                 self.window_size,
+                TOTAL_CP_WORLD_SIZE=self.total_cp_world_size,
+                TOTAL_CP_RANK=self.total_cp_rank,
+                CP_KV_CACHE_INTERLEAVE_SIZE=self.cp_kv_cache_interleave_size,
                 BLOCK_SIZE=triton.next_power_of_2(num_prefills),
             )
 
             result["prefill_seq_lens"] = seq_lens[num_decodes:]
+            result["prefill_swa_seq_lens"] = pfx_swa_seq_lens
             result["prefill_gather_lens"] = pfx_gather_lens
 
         return result
 
 
 @triton.jit
+def _cp_local_token_count(
+    length,
+    TOTAL_CP_WORLD_SIZE: tl.constexpr,
+    TOTAL_CP_RANK: tl.constexpr,
+    CP_KV_CACHE_INTERLEAVE_SIZE: tl.constexpr,
+):
+    base = (
+        length
+        // CP_KV_CACHE_INTERLEAVE_SIZE
+        // TOTAL_CP_WORLD_SIZE
+        * CP_KV_CACHE_INTERLEAVE_SIZE
+    )
+    remainder = length - base * TOTAL_CP_WORLD_SIZE
+    extra = tl.minimum(
+        tl.maximum(remainder - TOTAL_CP_RANK * CP_KV_CACHE_INTERLEAVE_SIZE, 0),
+        CP_KV_CACHE_INTERLEAVE_SIZE,
+    )
+    return base + extra
+
+
+@triton.jit
 def _compute_prefill_metadata_kernel(
     # Outputs
+    prefill_swa_seq_lens_ptr,
     prefill_gather_lens_ptr,
     # Inputs
     seq_lens_ptr,
@@ -420,9 +485,12 @@ def _compute_prefill_metadata_kernel(
     num_prefills,
     num_decodes,
     window_size,
+    TOTAL_CP_WORLD_SIZE: tl.constexpr,
+    TOTAL_CP_RANK: tl.constexpr,
+    CP_KV_CACHE_INTERLEAVE_SIZE: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
-    """Compute prefill gather_lens in a single pass."""
+    """Compute DCP-local SWA prefill seq_lens/gather_lens in a single pass."""
     offset = tl.arange(0, BLOCK_SIZE)
     mask = offset < num_prefills
 
@@ -433,8 +501,24 @@ def _compute_prefill_metadata_kernel(
     query_len = qsl_end - qsl_start
     prefix_len = seq_len - query_len
     gather_len = query_len + tl.minimum(prefix_len, window_size - 1)
+    gather_start = seq_len - gather_len
 
-    tl.store(prefill_gather_lens_ptr + offset, gather_len, mask=mask)
+    local_seq_len = _cp_local_token_count(
+        seq_len,
+        TOTAL_CP_WORLD_SIZE,
+        TOTAL_CP_RANK,
+        CP_KV_CACHE_INTERLEAVE_SIZE,
+    )
+    local_gather_start = _cp_local_token_count(
+        gather_start,
+        TOTAL_CP_WORLD_SIZE,
+        TOTAL_CP_RANK,
+        CP_KV_CACHE_INTERLEAVE_SIZE,
+    )
+    local_gather_len = local_seq_len - local_gather_start
+
+    tl.store(prefill_swa_seq_lens_ptr + offset, local_seq_len, mask=mask)
+    tl.store(prefill_gather_lens_ptr + offset, local_gather_len, mask=mask)
 
 
 @triton.jit
@@ -450,12 +534,22 @@ def _compute_swa_indices_and_lens_kernel(
     block_table_ptr,
     block_table_stride,
     block_size,
+    TOTAL_CP_WORLD_SIZE: tl.constexpr,
+    TOTAL_CP_RANK: tl.constexpr,
+    CP_KV_CACHE_INTERLEAVE_SIZE: tl.constexpr,
     TRITON_BLOCK_SIZE: tl.constexpr,
 ):
     token_idx = tl.program_id(0)
     is_valid = tl.load(is_valid_token_ptr + token_idx)
     if not is_valid:
         tl.store(swa_lens_ptr + token_idx, 0)
+        for i in range(0, window_size, TRITON_BLOCK_SIZE):
+            offset = i + tl.arange(0, TRITON_BLOCK_SIZE)
+            tl.store(
+                swa_indices_ptr + token_idx * swa_indices_stride + offset,
+                -1,
+                mask=offset < window_size,
+            )
         return
 
     req_idx = tl.load(token_to_req_indices_ptr + token_idx)
@@ -471,24 +565,42 @@ def _compute_swa_indices_and_lens_kernel(
     start_pos = tl.maximum(pos - window_size + 1, 0)
     end_pos = pos + 1
 
-    swa_len = end_pos - start_pos
-    tl.store(swa_lens_ptr + token_idx, swa_len)
+    local_swa_len = tl.zeros((), dtype=tl.int32)
 
     for i in range(0, window_size, TRITON_BLOCK_SIZE):
         offset = i + tl.arange(0, TRITON_BLOCK_SIZE)
-
-        pos_offset = start_pos + offset
-        block_indices = pos_offset // block_size
-        block_numbers = tl.load(
-            block_table_ptr + req_idx * block_table_stride + block_indices,
-            mask=pos_offset < end_pos,
-        )
-        block_offsets = pos_offset % block_size
-        slot_ids = block_numbers * block_size + block_offsets
-
-        slot_ids = tl.where(offset < swa_len, slot_ids, -1)
         tl.store(
             swa_indices_ptr + token_idx * swa_indices_stride + offset,
-            slot_ids,
+            -1,
             mask=offset < window_size,
         )
+
+        pos_offset = start_pos + offset
+        in_window = pos_offset < end_pos
+        virtual_block_size = block_size * TOTAL_CP_WORLD_SIZE
+        block_indices = pos_offset // virtual_block_size
+        block_numbers = tl.load(
+            block_table_ptr + req_idx * block_table_stride + block_indices,
+            mask=in_window,
+        )
+        virtual_block_offsets = pos_offset - block_indices * virtual_block_size
+        is_local = (
+            virtual_block_offsets // CP_KV_CACHE_INTERLEAVE_SIZE
+        ) % TOTAL_CP_WORLD_SIZE == TOTAL_CP_RANK
+        is_local = is_local & in_window
+        local_block_offsets = (
+            virtual_block_offsets // (TOTAL_CP_WORLD_SIZE * CP_KV_CACHE_INTERLEAVE_SIZE)
+        ) * CP_KV_CACHE_INTERLEAVE_SIZE + (
+            virtual_block_offsets % CP_KV_CACHE_INTERLEAVE_SIZE
+        )
+
+        slot_ids = block_numbers * block_size + local_block_offsets
+        packed_offsets = local_swa_len + tl.cumsum(is_local.to(tl.int32), 0) - 1
+        tl.store(
+            swa_indices_ptr + token_idx * swa_indices_stride + packed_offsets,
+            slot_ids,
+            mask=is_local,
+        )
+        local_swa_len += tl.sum(is_local.to(tl.int32), axis=0)
+
+    tl.store(swa_lens_ptr + token_idx, local_swa_len)
