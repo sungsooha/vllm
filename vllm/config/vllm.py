@@ -1674,6 +1674,8 @@ class VllmConfig:
         if self.model_config is None:
             return
 
+        self._validate_deepseek_v4_dcp()
+
         # Avoid running try_verify_and_update_config multiple times
         if getattr(self.model_config, "config_updated", False):
             return
@@ -1721,6 +1723,84 @@ class VllmConfig:
                     f"but got '{self.load_config.load_format}'. "
                     f"Model: {self.model_config.model}"
                 )
+
+    def _is_deepseek_v4_model(self) -> bool:
+        if self.model_config is None:
+            return False
+
+        if getattr(self.model_config, "architecture", None) == "DeepseekV4ForCausalLM":
+            return True
+
+        hf_configs = (
+            getattr(self.model_config, "hf_config", None),
+            getattr(self.model_config, "hf_text_config", None),
+        )
+        return any(
+            getattr(hf_config, "model_type", None) == "deepseek_v4"
+            for hf_config in hf_configs
+            if hf_config is not None
+        )
+
+    def _validate_deepseek_v4_dcp(self) -> None:
+        """Keep DeepSeek V4 DCP fail-closed until V4 paths are DCP-safe."""
+        if not self._is_deepseek_v4_model():
+            return
+
+        dcp_size = self.parallel_config.decode_context_parallel_size
+        if dcp_size <= 1:
+            return
+
+        unsupported: list[str] = []
+
+        if not envs.VLLM_ENABLE_DEEPSEEK_V4_DCP:
+            unsupported.append(
+                "VLLM_ENABLE_DEEPSEEK_V4_DCP is not set. Set it to 1 only "
+                "for development builds that include V4 DCP KV-cache and "
+                "attention support"
+            )
+
+        if self.parallel_config.dcp_comm_backend != "a2a":
+            unsupported.append(
+                "dcp_comm_backend must be 'a2a' "
+                f"(got {self.parallel_config.dcp_comm_backend!r})"
+            )
+
+        if self.parallel_config.prefill_context_parallel_size != 1:
+            unsupported.append(
+                "prefill_context_parallel_size must be 1 "
+                f"(got {self.parallel_config.prefill_context_parallel_size})"
+            )
+
+        if self.cache_config.enable_prefix_caching:
+            unsupported.append(
+                "prefix caching must be disabled for the initial DCP MVP "
+                "(use --no-enable-prefix-caching)"
+            )
+
+        if self.speculative_config is not None:
+            method = getattr(self.speculative_config, "method", None)
+            suffix = f" method {method!r}" if method is not None else ""
+            unsupported.append(f"speculative decoding/MTP must be disabled{suffix}")
+
+        graphs_disabled = (
+            getattr(self.model_config, "enforce_eager", False)
+            or self.compilation_config.cudagraph_mode == CUDAGraphMode.NONE
+        )
+        if not graphs_disabled:
+            unsupported.append(
+                "CUDA graphs must be explicitly disabled for the first DCP "
+                "MVP (use --enforce-eager or -cc.cudagraph_mode=none)"
+            )
+
+        if unsupported:
+            raise ValueError(
+                "DeepSeek V4 decode context parallelism is gated for the "
+                "Helix MVP. Required combination: "
+                "decode_context_parallel_size > 1, dcp_comm_backend='a2a', "
+                "prefill_context_parallel_size=1, prefix caching disabled, "
+                "no speculative decoding/MTP, and eager mode or cudagraphs "
+                "disabled. Unsupported current settings: " + "; ".join(unsupported)
+            )
 
     def compile_debug_dump_path(self) -> Path | None:
         """Returns a rank-aware path for dumping
