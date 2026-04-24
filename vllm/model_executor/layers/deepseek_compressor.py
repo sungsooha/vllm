@@ -167,7 +167,10 @@ class CompressorStateCache(torch.nn.Module, AttentionLayerBase):
             dtype=self.dtype,
             sliding_window=self.sliding_window,
             alignment=576,  # NOTE: FlashMLA requires 576B alignment
-            dcp_shardable=True,
+            # A compressed KV token depends on a full compressor-state window
+            # that spans multiple DCP token owners. Keep this state replicated
+            # across DCP ranks; only the derived MLA KV caches are sharded.
+            dcp_transparent=True,
         )
 
     def forward(self): ...

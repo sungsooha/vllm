@@ -8,6 +8,12 @@ from vllm.model_executor.layers.deepseek_v4_attention import (
     _apply_attn_sink_with_lse,
     _get_dcp_padded_head_counts,
 )
+from vllm.v1.kv_cache_interface import (
+    SlidingWindowMLASpec,
+    get_kv_cache_spec_dcp_policy,
+    get_kv_cache_spec_dcp_world_size,
+    get_kv_cache_spec_effective_block_size,
+)
 
 
 def _owner(pos: int, cp_world_size: int, interleave: int) -> int:
@@ -116,3 +122,44 @@ def test_deepseek_v4_dcp_attn_sink_uses_global_lse_once():
 
     torch.testing.assert_close(actual, output * expected_scale.unsqueeze(-1))
     torch.testing.assert_close(actual[:, 2], output[:, 2])
+
+
+def test_deepseek_v4_compressor_state_window_spans_dcp_ranks():
+    cp_world_size = 4
+    interleave = 1
+
+    # C4A compressed tokens need an 8-token state window; C128A needs 128.
+    # With DCP token sharding, those source states are owned by multiple ranks.
+    for compress_ratio, overlap in [(4, True), (128, False)]:
+        window = (1 + int(overlap)) * compress_ratio
+        boundary_pos = window - 1
+        start = boundary_pos - window + 1
+        owners = {
+            _owner(pos, cp_world_size, interleave)
+            for pos in range(start, boundary_pos + 1)
+        }
+
+        assert len(owners) > 1
+
+
+def test_deepseek_v4_compressor_state_cache_is_dcp_transparent():
+    spec = SlidingWindowMLASpec(
+        block_size=4,
+        num_kv_heads=1,
+        head_size=2048,
+        dtype=torch.float32,
+        sliding_window=8,
+        alignment=576,
+        dcp_transparent=True,
+    )
+
+    assert get_kv_cache_spec_dcp_policy(spec) == "transparent"
+    assert get_kv_cache_spec_dcp_world_size(spec, dcp_world_size=4) == 1
+    assert (
+        get_kv_cache_spec_effective_block_size(
+            spec,
+            dcp_world_size=4,
+            pcp_world_size=1,
+        )
+        == 4
+    )
