@@ -23,6 +23,7 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowMLASpec,
     SlidingWindowSpec,
     TQFullAttentionSpec,
+    get_kv_cache_spec_dcp_world_size,
 )
 from vllm.v1.request import Request
 
@@ -57,6 +58,7 @@ class SingleTypeKVCacheManager(ABC):
                 block until the request finishes.
         """
         self.block_size = kv_cache_spec.block_size
+        dcp_world_size = get_kv_cache_spec_dcp_world_size(kv_cache_spec, dcp_world_size)
         self.dcp_world_size = dcp_world_size
         self.pcp_world_size = pcp_world_size
         if dcp_world_size * pcp_world_size > 1:
@@ -818,7 +820,8 @@ class MambaManager(SingleTypeKVCacheManager):
         assert isinstance(kv_cache_spec, MambaSpec), (
             "MambaManager can only be used for mamba groups"
         )
-        assert dcp_world_size == 1, "DCP not support mamba now."
+        # Mamba state is fixed-size and DCP-transparent. Each DCP rank
+        # maintains equivalent local state, so DCP does not scale this manager.
         assert pcp_world_size == 1, "PCP not support mamba now."
         computed_blocks: tuple[list[KVCacheBlock], ...] = tuple(
             [] for _ in range(len(kv_cache_group_ids))

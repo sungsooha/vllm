@@ -8,7 +8,7 @@ from collections import Counter
 from dataclasses import dataclass, fields, replace
 from enum import IntEnum
 from math import prod
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal, TypeAlias
 
 import torch
 from typing_extensions import Self
@@ -21,6 +21,8 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
 logger = init_logger(__name__)
+
+KVCacheDCPPolicy: TypeAlias = Literal["sharded", "transparent", "unsupported"]
 
 
 # ---------------------------------------------------------------------------
@@ -484,6 +486,25 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
             * get_dtype_size(self.dtype)
         )
 
+    def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
+        if self.model_version != "deepseek_v4":
+            return super().max_memory_usage_bytes(vllm_config)
+
+        max_model_len = vllm_config.model_config.max_model_len
+        max_num_batched_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+        num_tokens = min(
+            self.sliding_window - 1 + max_num_batched_tokens,
+            max_model_len,
+        )
+
+        dcp_world_size = vllm_config.parallel_config.decode_context_parallel_size
+        pcp_world_size = vllm_config.parallel_config.prefill_context_parallel_size
+        cp_world_size = dcp_world_size * pcp_world_size
+        if cp_world_size > 1:
+            num_tokens = cdiv(num_tokens, cp_world_size)
+
+        return (cdiv(num_tokens, self.block_size) + 1) * self.page_size_bytes
+
     @classmethod
     def merge(cls, specs: list[Self]) -> Self:
         assert all(isinstance(spec, SlidingWindowMLASpec) for spec in specs), (
@@ -772,3 +793,65 @@ class KVCacheConfig:
     @property
     def needs_kv_cache_zeroing(self) -> bool:
         return self.has_mamba_layers
+
+
+def get_kv_cache_spec_dcp_policy(spec: KVCacheSpec) -> KVCacheDCPPolicy:
+    if isinstance(spec, UniformTypeKVCacheSpecs):
+        policies = {
+            get_kv_cache_spec_dcp_policy(inner_spec)
+            for inner_spec in spec.kv_cache_specs.values()
+        }
+        if len(policies) == 1:
+            return policies.pop()
+        return "unsupported"
+
+    if isinstance(spec, MambaSpec):
+        return "transparent"
+
+    if isinstance(spec, SlidingWindowMLASpec):
+        return "sharded" if spec.model_version == "deepseek_v4" else "unsupported"
+
+    if isinstance(spec, SlidingWindowSpec):
+        return "unsupported"
+
+    if isinstance(spec, ChunkedLocalAttentionSpec):
+        return "unsupported"
+
+    if isinstance(spec, CrossAttentionSpec):
+        return "unsupported"
+
+    if isinstance(spec, FullAttentionSpec):
+        return "sharded"
+
+    return "unsupported"
+
+
+def get_kv_cache_spec_dcp_world_size(
+    spec: KVCacheSpec,
+    dcp_world_size: int,
+) -> int:
+    if dcp_world_size <= 1:
+        return 1
+
+    policy = get_kv_cache_spec_dcp_policy(spec)
+    if policy == "sharded":
+        return dcp_world_size
+    if policy == "transparent":
+        return 1
+
+    raise ValueError(
+        "Decode context parallelism does not support KV cache spec "
+        f"{type(spec).__name__}."
+    )
+
+
+def get_kv_cache_spec_effective_block_size(
+    spec: KVCacheSpec,
+    dcp_world_size: int,
+    pcp_world_size: int = 1,
+) -> int:
+    return (
+        spec.block_size
+        * get_kv_cache_spec_dcp_world_size(spec, dcp_world_size)
+        * pcp_world_size
+    )

@@ -3,6 +3,7 @@
 import hashlib
 import importlib
 from collections.abc import Callable
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -46,8 +47,10 @@ from vllm.v1.kv_cache_interface import (
     KVCacheTensor,
     MambaSpec,
     MLAAttentionSpec,
+    SlidingWindowMLASpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
+    get_kv_cache_spec_dcp_world_size,
 )
 from vllm.v1.metrics.stats import CachingMetrics, PrefixCacheStats
 from vllm.v1.request import Request
@@ -1865,6 +1868,31 @@ def new_mla_spec(cache_dtype_str=None):
     )
 
 
+def new_deepseek_v4_mla_spec(block_size=256):
+    return MLAAttentionSpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.uint8,
+        cache_dtype_str="fp8_ds_mla",
+        alignment=576,
+        model_version="deepseek_v4",
+    )
+
+
+def new_deepseek_v4_swa_spec(block_size=64, sliding_window=256):
+    return SlidingWindowMLASpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.uint8,
+        sliding_window=sliding_window,
+        cache_dtype_str="fp8_ds_mla",
+        alignment=576,
+        model_version="deepseek_v4",
+    )
+
+
 def test_merge_mla_spec():
     kv_cache_specs = [
         new_mla_spec(),
@@ -1900,6 +1928,94 @@ def test_merge_mla_spec():
     ]
     with pytest.raises(AssertionError):
         kv_cache_specs[0].merge(kv_cache_specs)
+
+
+def _dcp_block_size_test_config(
+    *,
+    dcp: int,
+    prefix_caching: bool = False,
+    hash_block_size: int | None = None,
+):
+    return SimpleNamespace(
+        cache_config=SimpleNamespace(
+            block_size=16,
+            enable_prefix_caching=prefix_caching,
+            hash_block_size=hash_block_size,
+        ),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=dcp,
+            prefill_context_parallel_size=1,
+        ),
+        kv_transfer_config=None,
+    )
+
+
+def test_resolve_kv_cache_block_sizes_deepseek_v4_dcp_no_prefix():
+    kv_cache_config = KVCacheConfig(
+        num_blocks=10,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["mla"], new_deepseek_v4_mla_spec(block_size=256)),
+            KVCacheGroupSpec(["swa"], new_deepseek_v4_swa_spec(block_size=64)),
+        ],
+    )
+    vllm_config = _dcp_block_size_test_config(dcp=2)
+
+    scheduler_block_size, hash_block_size = kv_cache_utils.resolve_kv_cache_block_sizes(
+        kv_cache_config,
+        vllm_config,
+    )
+
+    assert scheduler_block_size == 512
+    assert hash_block_size == 512
+
+
+def test_resolve_kv_cache_block_sizes_deepseek_v4_dcp_rejects_prefix():
+    kv_cache_config = KVCacheConfig(
+        num_blocks=10,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["mla"], new_deepseek_v4_mla_spec(block_size=256)),
+            KVCacheGroupSpec(["swa"], new_deepseek_v4_swa_spec(block_size=64)),
+        ],
+    )
+    vllm_config = _dcp_block_size_test_config(dcp=2, prefix_caching=True)
+
+    with pytest.raises(ValueError, match="sliding-window MLA"):
+        kv_cache_utils.resolve_kv_cache_block_sizes(kv_cache_config, vllm_config)
+
+
+def test_resolve_kv_cache_block_sizes_dcp_keeps_mamba_transparent():
+    kv_cache_config = KVCacheConfig(
+        num_blocks=10,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["attn"], new_kv_cache_spec(block_size=16)),
+            KVCacheGroupSpec(["mamba"], new_mamba_spec(block_size=8)),
+        ],
+    )
+    vllm_config = _dcp_block_size_test_config(dcp=4, prefix_caching=True)
+
+    scheduler_block_size, hash_block_size = kv_cache_utils.resolve_kv_cache_block_sizes(
+        kv_cache_config,
+        vllm_config,
+    )
+
+    attn_spec = kv_cache_config.kv_cache_groups[0].kv_cache_spec
+    mamba_spec = kv_cache_config.kv_cache_groups[1].kv_cache_spec
+    assert get_kv_cache_spec_dcp_world_size(attn_spec, 4) == 4
+    assert get_kv_cache_spec_dcp_world_size(mamba_spec, 4) == 1
+    assert scheduler_block_size == 64
+    assert hash_block_size == 8
+
+
+def test_deepseek_v4_swa_memory_allows_dcp():
+    spec = new_deepseek_v4_swa_spec(block_size=64, sliding_window=256)
+    vllm_config = _dcp_block_size_test_config(dcp=2)
+    vllm_config.model_config = SimpleNamespace(max_model_len=1024)
+    vllm_config.scheduler_config = SimpleNamespace(max_num_batched_tokens=128)
+
+    assert spec.max_memory_usage_bytes(vllm_config) > 0
 
 
 @pytest.mark.parametrize("hash_fn", [sha256, sha256_cbor])

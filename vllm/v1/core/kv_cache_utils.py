@@ -30,6 +30,9 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowMLASpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
+    get_kv_cache_spec_dcp_policy,
+    get_kv_cache_spec_dcp_world_size,
+    get_kv_cache_spec_effective_block_size,
 )
 from vllm.v1.request import Request
 from vllm.v1.utils import tensor_data
@@ -573,46 +576,70 @@ def resolve_kv_cache_block_sizes(
     """Resolve (scheduler_block_size, hash_block_size).
 
     - ``scheduler_block_size`` is the token-alignment invariant used by the
-      scheduler (e.g. for ``num_computed_tokens`` rounding). Single group:
-      ``cache_config.block_size * dcp * pcp``. Multiple groups: LCM of every
-      group's block size — context parallelism is not supported here.
+      scheduler (e.g. for ``num_computed_tokens`` rounding). It is the LCM of
+      each group's DCP-effective block size.
     - ``hash_block_size`` is the granularity at which ``Request.block_hashes``
       is computed. Single group: equals scheduler block size. Multiple groups:
       ``cache_config.hash_block_size`` override if set, else the GCD of group
       block sizes; every group's block size must be divisible by it. Returns
       the scheduler block size (i.e. disables finer hashing) if block hashing
-      is inactive or a mamba group's block size diverges from the cache
-      block size (mamba_cache_mode != "align").
+      is inactive or a non-DCP mamba group's block size diverges from the
+      cache block size (mamba_cache_mode != "align").
     """
     cache_config = vllm_config.cache_config
     dcp = vllm_config.parallel_config.decode_context_parallel_size
     pcp = vllm_config.parallel_config.prefill_context_parallel_size
     groups = kv_cache_config.kv_cache_groups
 
-    if len(groups) <= 1:  # Single group: block_size * dcp * pcp
+    if len(groups) == 0:
         bs = cache_config.block_size * dcp * pcp
         return bs, bs
 
-    if dcp != 1 or pcp != 1:
+    if len(groups) == 1:
+        bs = get_kv_cache_spec_effective_block_size(
+            groups[0].kv_cache_spec,
+            dcp,
+            pcp,
+        )
+        return bs, bs
+
+    if pcp != 1:
         raise ValueError(
             "Hybrid KV cache groups with multiple block sizes do not "
-            "support context parallelism (dcp_world_size/pcp_world_size > 1)."
+            "support prefill context parallelism (pcp_world_size > 1)."
         )
 
-    group_block_sizes = [g.kv_cache_spec.block_size for g in groups]
+    group_block_sizes = [
+        get_kv_cache_spec_effective_block_size(g.kv_cache_spec, dcp, pcp)
+        for g in groups
+    ]
     scheduler_block_size = math.lcm(*group_block_sizes)
 
     # Block hashes are only consumed by prefix caching and KV connectors
     # (P/D, offloading); when neither is active, keep hash_block_size equal
     # to the scheduler block size.
     connector_enabled = vllm_config.kv_transfer_config is not None
+    if dcp > 1 and (cache_config.enable_prefix_caching or connector_enabled):
+        unsafe_specs = [
+            type(g.kv_cache_spec).__name__
+            for g in groups
+            if isinstance(g.kv_cache_spec, SlidingWindowMLASpec)
+        ]
+        if unsafe_specs:
+            raise ValueError(
+                "Hybrid KV cache with DCP and sliding-window MLA does not "
+                "support prefix caching or KV connectors yet. Disable prefix "
+                "caching and KV transfer for the DeepSeek V4 DCP MVP. "
+                f"Unsafe specs: {unsafe_specs}."
+            )
+
     if not (cache_config.enable_prefix_caching or connector_enabled):
         return scheduler_block_size, scheduler_block_size
 
     # Mamba groups with block_size != cache_config.block_size
     # (mamba_cache_mode != "align") break divisibility; back off to the
     # scheduler block size.
-    if any(
+    if dcp == 1 and any(
         isinstance(g.kv_cache_spec, MambaSpec)
         and g.kv_cache_spec.block_size != cache_config.block_size
         for g in groups
@@ -1692,6 +1719,35 @@ def _report_kv_cache_config(
         kv_cache_config: The resolved KV cache configuration
     """
     max_model_len = vllm_config.model_config.max_model_len
+    dcp_size = vllm_config.parallel_config.decode_context_parallel_size
+    pcp_size = vllm_config.parallel_config.prefill_context_parallel_size
+
+    if dcp_size > 1:
+        policies: list[str] = []
+        for group_idx, group in enumerate(kv_cache_config.kv_cache_groups):
+            policy = get_kv_cache_spec_dcp_policy(group.kv_cache_spec)
+            group_dcp = get_kv_cache_spec_dcp_world_size(
+                group.kv_cache_spec,
+                dcp_size,
+            )
+            effective_block_size = get_kv_cache_spec_effective_block_size(
+                group.kv_cache_spec,
+                dcp_size,
+                pcp_size,
+            )
+            policies.append(
+                f"group={group_idx}, spec={type(group.kv_cache_spec).__name__}, "
+                f"policy={policy}, dcp_world_size={group_dcp}, "
+                f"block_size={group.kv_cache_spec.block_size}, "
+                f"effective_block_size={effective_block_size}, "
+                f"layers={len(group.layer_names)}"
+            )
+        logger.info_once(
+            "KV cache DCP policies: %s",
+            "; ".join(policies),
+            scope="local",
+        )
+
     max_concurrency = get_max_concurrency_for_kv_cache_config(
         vllm_config, kv_cache_config
     )
