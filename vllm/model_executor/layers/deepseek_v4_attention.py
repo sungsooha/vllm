@@ -68,6 +68,8 @@ from vllm.v1.attention.backends.mla.indexer import (
     get_max_prefill_buffer_size,
 )
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
+from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
+from vllm.v1.attention.ops.dcp_alltoall import dcp_a2a_lse_reduce
 from vllm.v1.attention.ops.flashmla import (
     flash_mla_sparse_fwd,
     flash_mla_with_kvcache,
@@ -81,6 +83,26 @@ logger = init_logger(__name__)
 # workspace allocated at _forward_prefill (and the matching profile-time
 # reservation in attention_impl's dummy-run branch).
 PREFILL_CHUNK_SIZE = 4
+
+
+def _get_dcp_padded_head_counts(
+    local_heads: int,
+    dcp_world_size: int,
+) -> tuple[int, int]:
+    global_heads = local_heads * dcp_world_size
+    for padded_global_heads in DeepseekV4MLAAttention.SUPPORTED_HEAD_COUNTS:
+        if (
+            global_heads <= padded_global_heads
+            and padded_global_heads % dcp_world_size == 0
+        ):
+            padded_local_heads = padded_global_heads // dcp_world_size
+            if local_heads <= padded_local_heads:
+                return padded_local_heads, padded_global_heads
+    raise ValueError(
+        "DeepseekV4 DCP requires gathered attention heads to fit a FlashMLA "
+        f"supported head count {DeepseekV4MLAAttention.SUPPORTED_HEAD_COUNTS}, "
+        f"got local_heads={local_heads}, dcp_world_size={dcp_world_size}."
+    )
 
 
 @dataclass
@@ -404,9 +426,25 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                 else (sub.max_model_len + sub.compress_ratio - 1) // sub.compress_ratio
             )
             M = N + sub.window_size + sub.max_num_batched_tokens
-            current_workspace_manager().get_simultaneous(
-                ((PREFILL_CHUNK_SIZE, M, q.shape[-1]), torch.bfloat16),
-            )
+            prefill_workspaces = [
+                ((PREFILL_CHUNK_SIZE, M, q.shape[-1]), torch.bfloat16)
+            ]
+            if sub.dcp_world_size > 1:
+                _, padded_global_heads = _get_dcp_padded_head_counts(
+                    sub.num_heads,
+                    sub.dcp_world_size,
+                )
+                prefill_workspaces.append(
+                    (
+                        (
+                            sub.max_num_batched_tokens,
+                            padded_global_heads,
+                            q.shape[-1],
+                        ),
+                        q.dtype,
+                    )
+                )
+            current_workspace_manager().get_simultaneous(*prefill_workspaces)
             out.zero_()
             return
 
@@ -595,6 +633,8 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         except AssertionError:
             dcp_world_size = 1
             dcp_rank = 0
+        self.dcp_world_size = dcp_world_size
+        self.dcp_rank = dcp_rank
         try:
             pcp_world_size = get_pcp_group().world_size
             pcp_rank = get_pcp_group().rank_in_group
@@ -605,6 +645,11 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         self.total_cp_rank = pcp_rank * dcp_world_size + dcp_rank
         self.cp_kv_cache_interleave_size = (
             vllm_config.parallel_config.cp_kv_cache_interleave_size
+        )
+        self.dcp_combine = (
+            dcp_a2a_lse_reduce
+            if vllm_config.parallel_config.dcp_comm_backend == "a2a"
+            else cp_lse_ag_out_rs
         )
         # DeepseekV4 only supports fp8 kv-cache format for now
         kv_cache_dtype = cache_config.cache_dtype if cache_config is not None else "fp8"
@@ -714,6 +759,80 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 output=output[:num_decode_tokens],
             )
 
+    def _prepare_dcp_query(
+        self,
+        q: torch.Tensor,
+    ) -> tuple[torch.Tensor, int]:
+        padded_local_heads, _ = _get_dcp_padded_head_counts(
+            self.num_heads,
+            self.dcp_world_size,
+        )
+        q_local = q[:, : self.num_heads, :]
+        if padded_local_heads > self.num_heads:
+            q_local = F.pad(q_local, (0, 0, 0, padded_local_heads - self.num_heads))
+        q_across_dcp = get_dcp_group().all_gather(q_local.contiguous(), dim=1)
+        return q_across_dcp, padded_local_heads
+
+    @staticmethod
+    def _normalize_flashmla_output(
+        out: torch.Tensor,
+        num_tokens: int,
+        num_heads: int,
+    ) -> torch.Tensor:
+        if out.ndim == 4 and out.shape[1] == 1:
+            out = out.squeeze(1)
+        elif out.ndim == 4 and out.shape[0] == 1:
+            out = out.squeeze(0)
+        assert out.shape == (
+            num_tokens,
+            num_heads,
+            out.shape[-1],
+        ), f"unexpected FlashMLA output shape {tuple(out.shape)}"
+        return out
+
+    @staticmethod
+    def _normalize_flashmla_lse(
+        lse: torch.Tensor,
+        num_tokens: int,
+        num_heads: int,
+    ) -> torch.Tensor:
+        if lse.ndim == 3:
+            if lse.shape == (num_tokens, num_heads, 1):
+                lse = lse.squeeze(-1)
+            elif lse.shape == (num_tokens, 1, num_heads):
+                lse = lse.squeeze(1)
+            elif lse.shape == (1, num_tokens, num_heads):
+                lse = lse.squeeze(0)
+            elif lse.shape == (num_heads, num_tokens, 1):
+                lse = lse.squeeze(-1).transpose(0, 1)
+        elif lse.ndim == 2 and lse.shape == (num_heads, num_tokens):
+            lse = lse.transpose(0, 1)
+        assert lse.shape == (
+            num_tokens,
+            num_heads,
+        ), f"unexpected FlashMLA LSE shape {tuple(lse.shape)}"
+        return lse.contiguous()
+
+    def _dcp_lse_combine(
+        self,
+        partial_out: torch.Tensor,
+        partial_lse: torch.Tensor,
+        output: torch.Tensor,
+        padded_local_heads: int,
+    ) -> None:
+        combined_out, _ = self.dcp_combine(
+            partial_out,
+            partial_lse,
+            get_dcp_group(),
+            return_lse=True,
+        )
+        assert combined_out.shape == (
+            output.shape[0],
+            padded_local_heads,
+            self.head_dim,
+        ), f"unexpected DCP-combined output shape {tuple(combined_out.shape)}"
+        output[:, :padded_local_heads, :].copy_(combined_out)
+
     def _forward_decode(
         self,
         q: torch.Tensor,
@@ -751,10 +870,16 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         swa_indices = swa_metadata.decode_swa_indices
         swa_lens = swa_metadata.decode_swa_lens
 
-        # We treat queries in the same seq as different queries
-        # and later we only attend by generated indices.
-        # q arrives pre-padded to self.padded_heads by the outer wrapper.
-        q = q.unsqueeze(1)
+        # We treat queries in the same seq as different queries and later we
+        # only attend by generated indices. Under DCP, gather actual local
+        # query heads across the DCP group before FlashMLA; the cross-rank LSE
+        # combine scatters the result back to this rank's local heads.
+        if self.dcp_world_size > 1:
+            q_flash, padded_local_heads = self._prepare_dcp_query(q)
+        else:
+            q_flash = q
+            padded_local_heads = self.padded_heads
+        q_flash = q_flash.unsqueeze(1)
 
         # Prepare SWA cache (num_blocks, swa_block_size, 1, head_bytes)
         # Use unsqueeze to preserve strides (handles padded blocks correctly)
@@ -787,8 +912,14 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             "allocate one for this layer type."
         )
 
-        out, _ = flash_mla_with_kvcache(
-            q=q,
+        flash_output = output
+        if self.dcp_world_size > 1:
+            (flash_output,) = current_workspace_manager().get_simultaneous(
+                ((num_decode_tokens, q_flash.shape[2], self.head_dim), q.dtype),
+            )
+
+        out, lse = flash_mla_with_kvcache(
+            q=q_flash,
             k_cache=swa_cache,
             block_table=None,
             head_dim_v=512,
@@ -798,12 +929,29 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             indices=swa_indices,
             topk_length=swa_lens,
             softmax_scale=self.scale,
-            attn_sink=self.attn_sink,
+            attn_sink=None if self.dcp_world_size > 1 else self.attn_sink,
             extra_k_cache=kv_cache if not swa_only else None,
             extra_indices_in_kvcache=topk_indices,
             extra_topk_length=topk_lens,
-            out=output.unsqueeze(1),
+            out=flash_output.unsqueeze(1),
         )
+        if self.dcp_world_size > 1:
+            partial_out = self._normalize_flashmla_output(
+                out,
+                num_decode_tokens,
+                q_flash.shape[2],
+            )
+            partial_lse = self._normalize_flashmla_lse(
+                lse,
+                num_decode_tokens,
+                q_flash.shape[2],
+            )
+            self._dcp_lse_combine(
+                partial_out,
+                partial_lse,
+                output,
+                padded_local_heads,
+            )
 
     def _forward_prefill(
         self,
@@ -860,13 +1008,53 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         num_chunks = (num_prefills + PREFILL_CHUNK_SIZE - 1) // PREFILL_CHUNK_SIZE
 
         workspace_manager = current_workspace_manager()
-        kv = workspace_manager.get_simultaneous(
-            ((PREFILL_CHUNK_SIZE, M, q.shape[-1]), torch.bfloat16),
-        )[0]
+        dcp_padded_global_heads = 0
+        max_chunk_tokens = 0
+        if self.dcp_world_size > 1:
+            _, dcp_padded_global_heads = _get_dcp_padded_head_counts(
+                self.num_heads,
+                self.dcp_world_size,
+            )
+            for chunk_idx in range(num_chunks):
+                chunk_start = chunk_idx * PREFILL_CHUNK_SIZE
+                chunk_end = min(chunk_start + PREFILL_CHUNK_SIZE, num_prefills)
+                query_start = (
+                    query_start_loc_cpu[num_decodes + chunk_start] - prefill_token_base
+                ).item()
+                query_end = (
+                    query_start_loc_cpu[num_decodes + chunk_end] - prefill_token_base
+                ).item()
+                max_chunk_tokens = max(max_chunk_tokens, query_end - query_start)
+
         for chunk_idx in range(num_chunks):
             chunk_start = chunk_idx * PREFILL_CHUNK_SIZE
             chunk_end = min(chunk_start + PREFILL_CHUNK_SIZE, num_prefills)
             chunk_size = chunk_end - chunk_start
+            query_start = (
+                query_start_loc_cpu[num_decodes + chunk_start] - prefill_token_base
+            ).item()
+            query_end = (
+                query_start_loc_cpu[num_decodes + chunk_end] - prefill_token_base
+            ).item()
+
+            prefill_workspaces = [
+                ((PREFILL_CHUNK_SIZE, M, q.shape[-1]), torch.bfloat16),
+            ]
+            if self.dcp_world_size > 1:
+                prefill_workspaces.append(
+                    (
+                        (
+                            max_chunk_tokens,
+                            dcp_padded_global_heads,
+                            self.head_dim,
+                        ),
+                        q.dtype,
+                    )
+                )
+            workspaces = workspace_manager.get_simultaneous(*prefill_workspaces)
+            kv = workspaces[0]
+            flash_output_workspace = workspaces[1] if self.dcp_world_size > 1 else None
+
             if not swa_only:
                 # Gather compressed KV
                 assert attn_metadata is not None
@@ -900,13 +1088,6 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             )
 
             # Combine the topk indices and SWA indices for gathered KV cache
-            query_start = (
-                query_start_loc_cpu[num_decodes + chunk_start] - prefill_token_base
-            )
-            query_end = (
-                query_start_loc_cpu[num_decodes + chunk_end] - prefill_token_base
-            )
-
             combined_indices, combined_lens = combine_topk_swa_indices(
                 topk_indices[query_start:query_end],
                 query_start_loc[
@@ -924,15 +1105,41 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
             )
 
-            output_chunk, _, _ = flash_mla_sparse_fwd(
-                q=q[query_start:query_end],
+            q_chunk = q[query_start:query_end]
+            if self.dcp_world_size > 1:
+                assert flash_output_workspace is not None
+                q_chunk, padded_local_heads = self._prepare_dcp_query(q_chunk)
+                flash_output = flash_output_workspace[: q_chunk.shape[0]]
+            else:
+                padded_local_heads = self.padded_heads
+                flash_output = output[query_start:query_end]
+
+            output_chunk, lse, _ = flash_mla_sparse_fwd(
+                q=q_chunk,
                 kv=kv.view(-1, 1, q.shape[-1]),
                 indices=combined_indices.unsqueeze(1),
                 sm_scale=self.scale,
-                attn_sink=self.attn_sink,
+                attn_sink=None if self.dcp_world_size > 1 else self.attn_sink,
                 topk_length=combined_lens,
-                out=output[query_start:query_end],
+                out=flash_output,
             )
+            if self.dcp_world_size > 1:
+                partial_out = self._normalize_flashmla_output(
+                    output_chunk,
+                    q_chunk.shape[0],
+                    q_chunk.shape[1],
+                )
+                partial_lse = self._normalize_flashmla_lse(
+                    lse,
+                    q_chunk.shape[0],
+                    q_chunk.shape[1],
+                )
+                self._dcp_lse_combine(
+                    partial_out,
+                    partial_lse,
+                    output[query_start:query_end],
+                    padded_local_heads,
+                )
 
 
 class DeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):
