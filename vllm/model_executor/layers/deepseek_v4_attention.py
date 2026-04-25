@@ -338,6 +338,19 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             self.layer_name,
         )
         o = o_padded[:, : self.n_local_heads, :]
+        dsv4_debug_dump(
+            "attn.wrapper.o_local",
+            layer_idx=dsv4_debug_layer_idx(self.prefix),
+            tensors={
+                "o": o,
+                "o_padded": o_padded,
+            },
+            extra={
+                "prefix": self.prefix,
+                "n_local_heads": self.n_local_heads,
+                "padded_heads": self.padded_heads,
+            },
+        )
 
         # O projection: inverse RoPE + FP8 quant + einsum + wo_b
         o_fp8, o_scale = fused_inv_rope_fp8_quant(
