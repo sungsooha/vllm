@@ -15,6 +15,8 @@ from vllm.v1.kv_cache_interface import (
     get_kv_cache_spec_dcp_policy,
     get_kv_cache_spec_dcp_world_size,
     get_kv_cache_spec_effective_block_size,
+    get_kv_cache_spec_total_cp_rank,
+    get_kv_cache_spec_total_cp_world_size,
 )
 
 
@@ -164,6 +166,46 @@ def test_deepseek_v4_compressor_state_cache_is_dcp_transparent():
             pcp_world_size=1,
         )
         == 4
+    )
+    assert get_kv_cache_spec_total_cp_world_size(spec, dcp_world_size=4) == 1
+    assert (
+        get_kv_cache_spec_total_cp_rank(
+            spec,
+            dcp_world_size=4,
+            dcp_rank=3,
+        )
+        == 0
+    )
+
+
+def test_deepseek_v4_dcp_transparent_state_still_honors_pcp():
+    spec = SlidingWindowMLASpec(
+        block_size=4,
+        num_kv_heads=1,
+        head_size=2048,
+        dtype=torch.float32,
+        sliding_window=8,
+        alignment=576,
+        dcp_transparent=True,
+    )
+
+    assert (
+        get_kv_cache_spec_total_cp_world_size(
+            spec,
+            dcp_world_size=4,
+            pcp_world_size=2,
+        )
+        == 2
+    )
+    assert (
+        get_kv_cache_spec_total_cp_rank(
+            spec,
+            dcp_world_size=4,
+            dcp_rank=3,
+            pcp_world_size=2,
+            pcp_rank=1,
+        )
+        == 1
     )
 
 

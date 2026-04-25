@@ -808,3 +808,23 @@ def get_kv_cache_spec_effective_block_size(
         * get_kv_cache_spec_dcp_world_size(spec, dcp_world_size)
         * pcp_world_size
     )
+
+
+def get_kv_cache_spec_total_cp_world_size(
+    spec: KVCacheSpec,
+    dcp_world_size: int,
+    pcp_world_size: int = 1,
+) -> int:
+    return get_kv_cache_spec_dcp_world_size(spec, dcp_world_size) * pcp_world_size
+
+
+def get_kv_cache_spec_total_cp_rank(
+    spec: KVCacheSpec,
+    dcp_world_size: int,
+    dcp_rank: int,
+    pcp_world_size: int = 1,
+    pcp_rank: int = 0,
+) -> int:
+    group_dcp_world_size = get_kv_cache_spec_dcp_world_size(spec, dcp_world_size)
+    group_dcp_rank = dcp_rank if group_dcp_world_size > 1 else 0
+    return pcp_rank * group_dcp_world_size + group_dcp_rank
