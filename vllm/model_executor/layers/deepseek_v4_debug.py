@@ -92,32 +92,37 @@ def _tensor_summary(tensor: torch.Tensor | None) -> dict[str, Any] | None:
     if detached.numel() == 0:
         return summary
 
-    cpu = detached
-    if cpu.is_cuda:
-        cpu = cpu.cpu()
-    flat = cpu.reshape(-1)
     sample_values = int(os.environ.get("VLLM_DSV4_DEBUG_VALUES", "8"))
-    summary["flat_sample"] = flat[:sample_values].tolist()
+    flat_sample = detached.reshape(-1)[:sample_values]
+    if flat_sample.is_cuda:
+        flat_sample = flat_sample.cpu()
+    summary["flat_sample"] = flat_sample.tolist()
 
-    try:
-        stats = flat.float()
-        finite = torch.isfinite(stats)
-        summary["finite_count"] = int(finite.sum().item())
-        summary["numel"] = int(stats.numel())
-        if bool(finite.any().item()):
-            finite_stats = stats[finite]
-            summary["mean"] = float(finite_stats.mean().item())
-            summary["std"] = float(finite_stats.std(unbiased=False).item())
-            summary["min"] = float(finite_stats.min().item())
-            summary["max"] = float(finite_stats.max().item())
-            summary["norm"] = float(torch.linalg.vector_norm(finite_stats).item())
-    except RuntimeError as exc:
-        summary["stats_error"] = str(exc)
+    full_stats = os.environ.get("VLLM_DSV4_DEBUG_FULL_STATS", "0") == "1"
+    cpu = detached.cpu() if detached.is_cuda and full_stats else detached
+    if full_stats:
+        flat = cpu.reshape(-1)
+        try:
+            stats = flat.float()
+            finite = torch.isfinite(stats)
+            summary["finite_count"] = int(finite.sum().item())
+            summary["numel"] = int(stats.numel())
+            if bool(finite.any().item()):
+                finite_stats = stats[finite]
+                summary["mean"] = float(finite_stats.mean().item())
+                summary["std"] = float(finite_stats.std(unbiased=False).item())
+                summary["min"] = float(finite_stats.min().item())
+                summary["max"] = float(finite_stats.max().item())
+                summary["norm"] = float(torch.linalg.vector_norm(finite_stats).item())
+        except RuntimeError as exc:
+            summary["stats_error"] = str(exc)
 
-    if cpu.ndim >= 1:
+    if detached.ndim >= 1:
         rows = []
-        for row_idx in _sample_rows(cpu):
-            row = cpu[row_idx].reshape(-1)
+        for row_idx in _sample_rows(detached):
+            row = detached[row_idx].reshape(-1)
+            if row.is_cuda:
+                row = row.cpu()
             row_summary: dict[str, Any] = {
                 "idx": row_idx,
                 "sample": row[:sample_values].tolist(),
@@ -131,11 +136,17 @@ def _tensor_summary(tensor: torch.Tensor | None) -> dict[str, Any] | None:
             rows.append(row_summary)
         summary["rows"] = rows
 
-    if cpu.ndim == 2 and cpu.shape[1] > 1024:
-        topk = min(int(os.environ.get("VLLM_DSV4_DEBUG_TOPK", "10")), cpu.shape[1])
+    if detached.ndim == 2 and detached.shape[1] > 1024:
+        topk = min(
+            int(os.environ.get("VLLM_DSV4_DEBUG_TOPK", "10")),
+            detached.shape[1],
+        )
         top_rows = []
-        for row_idx in _sample_rows(cpu):
-            values, indices = torch.topk(cpu[row_idx].float(), k=topk)
+        for row_idx in _sample_rows(detached):
+            values, indices = torch.topk(detached[row_idx].float(), k=topk)
+            if values.is_cuda:
+                values = values.cpu()
+                indices = indices.cpu()
             top_rows.append(
                 {
                     "idx": row_idx,
