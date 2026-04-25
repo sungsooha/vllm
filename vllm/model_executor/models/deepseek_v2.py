@@ -47,6 +47,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+from vllm.model_executor.layers.deepseek_v4_debug import dsv4_debug_dump
 from vllm.model_executor.layers.fused_moe import (
     GateLinear,
     RoutingMethodType,
@@ -1132,6 +1133,16 @@ class DeepseekV2DecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
+        dsv4_debug_dump(
+            "decoder.input_norm",
+            layer_idx=self.layer_idx,
+            tensors={
+                "positions": positions,
+                "hidden_states": hidden_states,
+                "residual": residual,
+            },
+        )
+
         attn_kwargs = {
             "positions": positions,
             "hidden_states": hidden_states,
@@ -1139,6 +1150,16 @@ class DeepseekV2DecoderLayer(nn.Module):
         if not self.use_mha:
             attn_kwargs["llama_4_scaling"] = llama_4_scaling
         hidden_states = self.self_attn(**attn_kwargs)
+
+        dsv4_debug_dump(
+            "decoder.attn_out",
+            layer_idx=self.layer_idx,
+            tensors={
+                "positions": positions,
+                "hidden_states": hidden_states,
+                "residual": residual,
+            },
+        )
 
         if (
             not isinstance(self.self_attn, DeepseekAttention)
@@ -1155,6 +1176,15 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        dsv4_debug_dump(
+            "decoder.post_attn_norm",
+            layer_idx=self.layer_idx,
+            tensors={
+                "positions": positions,
+                "hidden_states": hidden_states,
+                "residual": residual,
+            },
+        )
         hidden_states = self.mlp(hidden_states)
 
         if isinstance(self.mlp, DeepseekV2MLP) and hidden_states.dtype == torch.float16:
@@ -1164,6 +1194,16 @@ class DeepseekV2DecoderLayer(nn.Module):
             # The scaling of DeepseekV2MOE output would be done in the forward
             # of DeepseekV2MOE
             hidden_states *= 1.0 / self.routed_scaling_factor
+
+        dsv4_debug_dump(
+            "decoder.mlp_out",
+            layer_idx=self.layer_idx,
+            tensors={
+                "positions": positions,
+                "hidden_states": hidden_states,
+                "residual": residual,
+            },
+        )
 
         return hidden_states, residual
 
@@ -1248,6 +1288,17 @@ class DeepseekV2Model(nn.Module):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
+        dsv4_debug_dump(
+            "model.input",
+            layer_idx=-1,
+            tensors={
+                "input_ids": input_ids,
+                "positions": positions,
+                "hidden_states": hidden_states,
+                "residual": residual,
+            },
+        )
+
         # Compute llama 4 scaling once per forward pass if enabled
         llama_4_scaling_config = getattr(self.config, "llama_4_scaling", None)
         llama_4_scaling: torch.Tensor | None
@@ -1279,6 +1330,14 @@ class DeepseekV2Model(nn.Module):
             )
 
         hidden_states, _ = self.norm(hidden_states, residual)
+        dsv4_debug_dump(
+            "model.final_norm",
+            layer_idx=-1,
+            tensors={
+                "positions": positions,
+                "hidden_states": hidden_states,
+            },
+        )
         if len(aux_hidden_states) > 0:
             return hidden_states, aux_hidden_states
         return hidden_states
@@ -1440,7 +1499,17 @@ class DeepseekV2ForCausalLM(
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
+        dsv4_debug_dump(
+            "lm_head.input",
+            layer_idx=-2,
+            tensors={"hidden_states": hidden_states},
+        )
         logits = self.logits_processor(self.lm_head, hidden_states)
+        dsv4_debug_dump(
+            "lm_head.logits",
+            layer_idx=-2,
+            tensors={"logits": logits},
+        )
         return logits
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:

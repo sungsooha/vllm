@@ -47,6 +47,10 @@ from vllm.logger import init_logger
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.deepseek_compressor import DeepseekCompressor
+from vllm.model_executor.layers.deepseek_v4_debug import (
+    dsv4_debug_dump,
+    dsv4_debug_layer_idx,
+)
 from vllm.model_executor.layers.layernorm import LayerNorm, RMSNorm
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.input_quant_fp8 import (
@@ -606,6 +610,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         self.topk_indices_buffer = topk_indices_buffer
 
         self.prefix = prefix  # Alias for compatibility with compressor
+        self.debug_layer_idx = dsv4_debug_layer_idx(prefix)
 
         self.aux_stream = aux_stream
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
@@ -852,6 +857,23 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             combined_lse,
             self.attn_sink[:padded_local_heads],
         )
+        dsv4_debug_dump(
+            "attn.dcp_lse_combine",
+            layer_idx=self.debug_layer_idx,
+            tensors={
+                "partial_out": partial_out,
+                "partial_lse": partial_lse,
+                "combined_out": combined_out,
+                "combined_lse": combined_lse,
+            },
+            extra={
+                "prefix": self.prefix,
+                "compress_ratio": self.compress_ratio,
+                "dcp_world_size": self.dcp_world_size,
+                "dcp_rank": self.dcp_rank,
+                "padded_local_heads": padded_local_heads,
+            },
+        )
         output[:, :padded_local_heads, :].copy_(combined_out)
 
     def _forward_decode(
@@ -939,6 +961,27 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 ((num_decode_tokens, q_flash.shape[2], self.head_dim), q.dtype),
             )
 
+        dsv4_debug_dump(
+            "attn.decode.before_flash",
+            layer_idx=self.debug_layer_idx,
+            tensors={
+                "q_flash": q_flash,
+                "swa_indices": swa_indices,
+                "swa_lens": swa_lens,
+                "topk_indices": topk_indices,
+                "topk_lens": topk_lens,
+            },
+            extra={
+                "prefix": self.prefix,
+                "compress_ratio": self.compress_ratio,
+                "swa_only": swa_only,
+                "num_decode_tokens": num_decode_tokens,
+                "dcp_world_size": self.dcp_world_size,
+                "dcp_rank": self.dcp_rank,
+                "padded_local_heads": padded_local_heads,
+            },
+        )
+
         out, lse = flash_mla_with_kvcache(
             q=q_flash,
             k_cache=swa_cache,
@@ -955,6 +998,22 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             extra_indices_in_kvcache=topk_indices,
             extra_topk_length=topk_lens,
             out=flash_output.unsqueeze(1),
+        )
+        dsv4_debug_dump(
+            "attn.decode.after_flash",
+            layer_idx=self.debug_layer_idx,
+            tensors={
+                "out": out,
+                "lse": lse,
+                "output": output,
+            },
+            extra={
+                "prefix": self.prefix,
+                "compress_ratio": self.compress_ratio,
+                "swa_only": swa_only,
+                "dcp_world_size": self.dcp_world_size,
+                "dcp_rank": self.dcp_rank,
+            },
         )
         if self.dcp_world_size > 1:
             partial_out = self._normalize_flashmla_output(
@@ -1135,6 +1194,38 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 padded_local_heads = self.padded_heads
                 flash_output = output[query_start:query_end]
 
+            dsv4_debug_dump(
+                "attn.prefill.before_flash",
+                layer_idx=self.debug_layer_idx,
+                tensors={
+                    "q_chunk": q_chunk,
+                    "kv": kv[:chunk_size],
+                    "topk_indices": topk_indices[query_start:query_end],
+                    "combined_indices": combined_indices,
+                    "combined_lens": combined_lens,
+                    "seq_lens": seq_lens[chunk_start:chunk_end],
+                    "swa_seq_lens": swa_seq_lens[chunk_start:chunk_end],
+                    "swa_gather_lens": swa_gather_lens[chunk_start:chunk_end],
+                },
+                extra={
+                    "prefix": self.prefix,
+                    "compress_ratio": self.compress_ratio,
+                    "swa_only": swa_only,
+                    "chunk_idx": chunk_idx,
+                    "chunk_size": chunk_size,
+                    "query_start": query_start,
+                    "query_end": query_end,
+                    "M": M,
+                    "N": N,
+                    "top_k": top_k,
+                    "dcp_world_size": self.dcp_world_size,
+                    "dcp_rank": self.dcp_rank,
+                    "total_cp_world_size": self.total_cp_world_size,
+                    "total_cp_rank": self.total_cp_rank,
+                    "padded_local_heads": padded_local_heads,
+                },
+            )
+
             output_chunk, lse, _ = flash_mla_sparse_fwd(
                 q=q_chunk,
                 kv=kv.view(-1, 1, q.shape[-1]),
@@ -1143,6 +1234,25 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 attn_sink=None if self.dcp_world_size > 1 else self.attn_sink,
                 topk_length=combined_lens,
                 out=flash_output,
+            )
+            dsv4_debug_dump(
+                "attn.prefill.after_flash",
+                layer_idx=self.debug_layer_idx,
+                tensors={
+                    "output_chunk": output_chunk,
+                    "lse": lse,
+                    "output_slice": output[query_start:query_end],
+                },
+                extra={
+                    "prefix": self.prefix,
+                    "compress_ratio": self.compress_ratio,
+                    "swa_only": swa_only,
+                    "chunk_idx": chunk_idx,
+                    "query_start": query_start,
+                    "query_end": query_end,
+                    "dcp_world_size": self.dcp_world_size,
+                    "dcp_rank": self.dcp_rank,
+                },
             )
             if self.dcp_world_size > 1:
                 partial_out = self._normalize_flashmla_output(
