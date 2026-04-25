@@ -950,10 +950,12 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         ), f"unexpected DCP-combined LSE shape {tuple(combined_lse.shape)}"
         # FlashMLA sink scaling does not affect returned LSE, so under DCP it
         # must be applied once after the global LSE is known.
+        combined_out_pre_sink = combined_out
+        attn_sink = self.attn_sink[:padded_local_heads]
         combined_out = _apply_attn_sink_with_lse(
-            combined_out,
+            combined_out_pre_sink,
             combined_lse,
-            self.attn_sink[:padded_local_heads],
+            attn_sink,
         )
         dsv4_debug_dump(
             "attn.dcp_lse_combine",
@@ -961,8 +963,10 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             tensors={
                 "partial_out": partial_out,
                 "partial_lse": partial_lse,
+                "combined_out_pre_sink": combined_out_pre_sink,
                 "combined_out": combined_out,
                 "combined_lse": combined_lse,
+                "attn_sink": attn_sink,
             },
             extra={
                 "prefix": self.prefix,
@@ -970,6 +974,8 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 "dcp_world_size": self.dcp_world_size,
                 "dcp_rank": self.dcp_rank,
                 "padded_local_heads": padded_local_heads,
+                "head_chunk_start": self.dcp_rank * padded_local_heads,
+                "head_chunk_end": (self.dcp_rank + 1) * padded_local_heads,
             },
         )
         output[:, :padded_local_heads, :].copy_(combined_out)
