@@ -20,6 +20,7 @@ from vllm.model_executor.layers.deepseek_v4_attention import (
     DeepseekV4MLAModules,
     DeepseekV4MultiHeadLatentAttentionWrapper,
 )
+from vllm.model_executor.layers.deepseek_v4_debug import dsv4_debug_dump
 from vllm.model_executor.layers.fused_moe import FusedMoE, GateLinear, SharedFusedMoE
 from vllm.model_executor.layers.fused_moe.layer import UnquantizedFusedMoEMethod
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -412,6 +413,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         super().__init__()
         config = vllm_config.model_config.hf_config
         self.hidden_size = config.hidden_size
+        self.layer_idx = extract_layer_index(prefix)
 
         self.rms_norm_eps = config.rms_norm_eps
         self.attn = DeepseekV4Attention(
@@ -515,12 +517,41 @@ class DeepseekV4DecoderLayer(nn.Module):
         positions: torch.Tensor,
         input_ids: torch.Tensor | None,
     ) -> torch.Tensor:
+        dsv4_debug_dump(
+            "decoder.input",
+            layer_idx=self.layer_idx,
+            tensors={
+                "positions": positions,
+                "input_ids": input_ids,
+                "hidden_states": x,
+            },
+        )
         residual = x
         x, post, comb = self.hc_pre(
             x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
         )
         x = self.attn_norm(x)
+        dsv4_debug_dump(
+            "decoder.input_norm",
+            layer_idx=self.layer_idx,
+            tensors={
+                "positions": positions,
+                "input_ids": input_ids,
+                "hidden_states": x,
+                "residual": residual,
+            },
+        )
         x = self.attn(positions, x, None)
+        dsv4_debug_dump(
+            "decoder.attn_out",
+            layer_idx=self.layer_idx,
+            tensors={
+                "positions": positions,
+                "input_ids": input_ids,
+                "hidden_states": x,
+                "residual": residual,
+            },
+        )
         x = self.hc_post(x, residual, post, comb)
 
         residual = x
@@ -529,6 +560,16 @@ class DeepseekV4DecoderLayer(nn.Module):
         )
         x = self.ffn_norm(x)
         x = self.ffn(x, input_ids)
+        dsv4_debug_dump(
+            "decoder.mlp_out",
+            layer_idx=self.layer_idx,
+            tensors={
+                "positions": positions,
+                "input_ids": input_ids,
+                "hidden_states": x,
+                "residual": residual,
+            },
+        )
         x = self.hc_post(x, residual, post, comb)
         return x
 
@@ -624,6 +665,15 @@ class DeepseekV4Model(nn.Module):
     ) -> torch.Tensor | IntermediateTensors:
         hidden_states = self.embed_input_ids(input_ids)
         hidden_states = hidden_states.unsqueeze(-2).repeat(1, self.hc_mult, 1)
+        dsv4_debug_dump(
+            "model.input",
+            layer_idx=-1,
+            tensors={
+                "input_ids": input_ids,
+                "positions": positions,
+                "hidden_states": hidden_states,
+            },
+        )
 
         for layer in islice(self.layers, self.start_layer, self.end_layer):
             hidden_states = layer(
@@ -645,6 +695,14 @@ class DeepseekV4Model(nn.Module):
             self.hc_eps,
         )
         hidden_states = self.norm(hidden_states)
+        dsv4_debug_dump(
+            "model.final_norm",
+            layer_idx=-1,
+            tensors={
+                "positions": positions,
+                "hidden_states": hidden_states,
+            },
+        )
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -820,7 +878,17 @@ class DeepseekV4ForCausalLM(nn.Module):
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
+        dsv4_debug_dump(
+            "lm_head.input",
+            layer_idx=-2,
+            tensors={"hidden_states": hidden_states},
+        )
         logits = self.logits_processor(self.lm_head, hidden_states)
+        dsv4_debug_dump(
+            "lm_head.logits",
+            layer_idx=-2,
+            tensors={"logits": logits},
+        )
         return logits
 
     def forward(
