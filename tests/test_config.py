@@ -168,12 +168,21 @@ def test_deepseek_v4_dcp_guard_rejects_unsupported_mvp_options(monkeypatch):
     message = str(exc_info.value)
     assert "dcp_comm_backend must be 'a2a'" in message
     assert "prefix caching must be disabled" in message
-    assert "CUDA graphs must be explicitly disabled" in message
+    assert "VLLM_ENABLE_DEEPSEEK_V4_DCP_CUDAGRAPH=1" in message
 
 
 def test_deepseek_v4_dcp_guard_allows_explicit_mvp_config(monkeypatch):
     monkeypatch.setenv("VLLM_ENABLE_DEEPSEEK_V4_DCP", "1")
     cfg = _deepseek_v4_dcp_test_config()
+
+    cfg._validate_deepseek_v4_dcp()
+
+
+def test_deepseek_v4_dcp_guard_allows_cudagraph_opt_in(monkeypatch):
+    monkeypatch.setenv("VLLM_ENABLE_DEEPSEEK_V4_DCP", "1")
+    monkeypatch.setenv("VLLM_ENABLE_DEEPSEEK_V4_DCP_CUDAGRAPH", "1")
+    cfg = _deepseek_v4_dcp_test_config(enforce_eager=False)
+    cfg.compilation_config.cudagraph_mode = CUDAGraphMode.FULL
 
     cfg._validate_deepseek_v4_dcp()
 

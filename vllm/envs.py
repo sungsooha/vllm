@@ -914,6 +914,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.environ.get("VLLM_ENABLE_DEEPSEEK_V4_DCP", "0").strip().lower()
         in ("1", "true")
     ),
+    # Additional opt-in for testing DeepSeek V4 DCP with CUDA graphs. The first
+    # DCP MVP keeps graphs disabled by default until graph capture/replay has
+    # separate parity coverage.
+    "VLLM_ENABLE_DEEPSEEK_V4_DCP_CUDAGRAPH": lambda: (
+        os.environ.get("VLLM_ENABLE_DEEPSEEK_V4_DCP_CUDAGRAPH", "0").strip().lower()
+        in ("1", "true")
+    ),
     # If set, forces FP8 Marlin to be used for FP8 quantization regardless
     # of the hardware support for FP8 compute.
     "VLLM_TEST_FORCE_FP8_MARLIN": lambda: (
