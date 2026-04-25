@@ -287,6 +287,13 @@ direct_register_custom_op(
 )
 
 
+def _get_model_parallel_group_timeout() -> timedelta | None:
+    timeout_s = envs.VLLM_MODEL_PARALLEL_GROUP_TIMEOUT_SECONDS
+    if timeout_s <= 0:
+        return None
+    return timedelta(seconds=timeout_s)
+
+
 class GroupCoordinator:
     """
     PyTorch ProcessGroup wrapper for a group of processes.
@@ -335,14 +342,17 @@ class GroupCoordinator:
         self_device_group = None
         self_cpu_group = None
 
+        group_timeout = _get_model_parallel_group_timeout()
         for ranks in group_ranks:
             device_group = torch.distributed.new_group(
-                ranks, backend=torch_distributed_backend
+                ranks, backend=torch_distributed_backend, timeout=group_timeout
             )
             # a group with `gloo` backend, to allow direct coordination between
             # processes through the CPU.
             with suppress_stdout():
-                cpu_group = torch.distributed.new_group(ranks, backend="gloo")
+                cpu_group = torch.distributed.new_group(
+                    ranks, backend="gloo", timeout=group_timeout
+                )
             if self.rank in ranks:
                 self.ranks = ranks
                 self.world_size = len(ranks)
