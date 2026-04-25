@@ -1782,14 +1782,14 @@ class VllmConfig:
             suffix = f" method {method!r}" if method is not None else ""
             unsupported.append(f"speculative decoding/MTP must be disabled{suffix}")
 
-        graphs_disabled = (
-            getattr(self.model_config, "enforce_eager", False)
-            or self.compilation_config.cudagraph_mode == CUDAGraphMode.NONE
+        graphs_enabled = (
+            not getattr(self.model_config, "enforce_eager", False)
+            and self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
         )
-        if not graphs_disabled:
+        if graphs_enabled and not envs.VLLM_ENABLE_DEEPSEEK_V4_DCP_CUDAGRAPH:
             unsupported.append(
-                "CUDA graphs must be explicitly disabled for the first DCP "
-                "MVP (use --enforce-eager or -cc.cudagraph_mode=none)"
+                "CUDA graphs require VLLM_ENABLE_DEEPSEEK_V4_DCP_CUDAGRAPH=1 "
+                "for the DeepSeek V4 DCP MVP"
             )
 
         if unsupported:
@@ -1798,8 +1798,9 @@ class VllmConfig:
                 "Helix MVP. Required combination: "
                 "decode_context_parallel_size > 1, dcp_comm_backend='a2a', "
                 "prefill_context_parallel_size=1, prefix caching disabled, "
-                "no speculative decoding/MTP, and eager mode or cudagraphs "
-                "disabled. Unsupported current settings: " + "; ".join(unsupported)
+                "no speculative decoding/MTP, and CUDA graphs disabled unless "
+                "VLLM_ENABLE_DEEPSEEK_V4_DCP_CUDAGRAPH=1. Unsupported current "
+                "settings: " + "; ".join(unsupported)
             )
 
     def compile_debug_dump_path(self) -> Path | None:
