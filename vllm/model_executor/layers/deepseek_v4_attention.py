@@ -4,6 +4,7 @@
 DeepseekV4 MLA Attention Layer
 """
 
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -50,6 +51,7 @@ from vllm.model_executor.layers.deepseek_compressor import DeepseekCompressor
 from vllm.model_executor.layers.deepseek_v4_debug import (
     dsv4_debug_dump,
     dsv4_debug_layer_idx,
+    dsv4_debug_should_dump,
 )
 from vllm.model_executor.layers.layernorm import LayerNorm, RMSNorm
 from vllm.model_executor.layers.quantization import QuantizationConfig
@@ -117,6 +119,89 @@ def _apply_attn_sink_with_lse(
     sink = attn_sink[: global_lse.shape[1]].to(global_lse.dtype)
     sink_scale = torch.sigmoid(global_lse - sink.unsqueeze(0))
     return output * sink_scale.unsqueeze(-1).to(output.dtype)
+
+
+def _dsv4_debug_sample_rows(num_rows: int) -> list[int]:
+    if num_rows <= 0:
+        return []
+    max_rows = int(os.environ.get("VLLM_DSV4_DEBUG_TOKEN_ROWS", "16"))
+    rows = list(range(min(max_rows, num_rows)))
+    last_idx = num_rows - 1
+    if last_idx not in rows:
+        rows.append(last_idx)
+    return rows
+
+
+def _dsv4_debug_prefill_kv_probe(
+    *,
+    layer_idx: int | None,
+    kv: torch.Tensor,
+    combined_indices: torch.Tensor,
+    combined_lens: torch.Tensor,
+    extra: dict[str, object],
+) -> None:
+    stage = "attn.prefill.kv_probe"
+    if not dsv4_debug_should_dump(stage, layer_idx):
+        return
+
+    rows = _dsv4_debug_sample_rows(combined_indices.shape[0])
+    if not rows:
+        return
+
+    device = combined_indices.device
+    row_tensor = torch.tensor(rows, dtype=torch.int32, device=device)
+    row_lens = combined_lens[row_tensor.long()].to(torch.int64)
+    num_cols = int(os.environ.get("VLLM_DSV4_DEBUG_KV_PROBE_COLS", "16"))
+    dim = min(kv.shape[-1], int(os.environ.get("VLLM_DSV4_DEBUG_KV_PROBE_DIMS", "32")))
+    col_offsets = torch.arange(num_cols, dtype=torch.int64, device=device)
+
+    prefix_cols = col_offsets.unsqueeze(0).expand(len(rows), -1)
+    prefix_valid = prefix_cols < row_lens.unsqueeze(1)
+    prefix_indices = combined_indices[row_tensor.long()].gather(
+        1, prefix_cols.clamp(max=combined_indices.shape[1] - 1).to(torch.long)
+    )
+    prefix_indices = torch.where(
+        prefix_valid, prefix_indices, torch.full_like(prefix_indices, -1)
+    )
+
+    suffix_start = torch.clamp(row_lens - num_cols, min=0)
+    suffix_cols = suffix_start.unsqueeze(1) + col_offsets.unsqueeze(0)
+    suffix_valid = suffix_cols < row_lens.unsqueeze(1)
+    suffix_indices = combined_indices[row_tensor.long()].gather(
+        1, suffix_cols.clamp(max=combined_indices.shape[1] - 1).to(torch.long)
+    )
+    suffix_indices = torch.where(
+        suffix_valid, suffix_indices, torch.full_like(suffix_indices, -1)
+    )
+
+    kv_flat = kv.reshape(-1, kv.shape[-1])
+
+    def gather_prefix(indices: torch.Tensor) -> torch.Tensor:
+        safe_indices = indices.clamp(min=0, max=kv_flat.shape[0] - 1).to(torch.long)
+        gathered = kv_flat.index_select(0, safe_indices.reshape(-1))
+        gathered = gathered.reshape(*indices.shape, kv.shape[-1])[..., :dim]
+        valid = (indices >= 0).unsqueeze(-1)
+        return torch.where(valid, gathered, torch.zeros_like(gathered)).contiguous()
+
+    dsv4_debug_dump(
+        stage,
+        layer_idx=layer_idx,
+        tensors={
+            "probe_rows": row_tensor,
+            "probe_lens": row_lens.to(torch.int32),
+            "prefix_indices": prefix_indices,
+            "prefix_kv_prefix": gather_prefix(prefix_indices),
+            "suffix_indices": suffix_indices,
+            "suffix_kv_prefix": gather_prefix(suffix_indices),
+        },
+        extra={
+            **extra,
+            "probe_cols": num_cols,
+            "probe_dims": dim,
+            "kv_shape": list(kv.shape),
+            "combined_indices_shape": list(combined_indices.shape),
+        },
+    )
 
 
 @dataclass
@@ -1235,6 +1320,30 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                     "dcp_rank": self.dcp_rank,
                     "total_cp_world_size": self.total_cp_world_size,
                     "total_cp_rank": self.total_cp_rank,
+                    "padded_local_heads": padded_local_heads,
+                },
+            )
+            _dsv4_debug_prefill_kv_probe(
+                layer_idx=self.debug_layer_idx,
+                kv=kv[:chunk_size],
+                combined_indices=combined_indices,
+                combined_lens=combined_lens,
+                extra={
+                    "prefix": self.prefix,
+                    "compress_ratio": self.compress_ratio,
+                    "swa_only": swa_only,
+                    "chunk_idx": chunk_idx,
+                    "chunk_size": chunk_size,
+                    "query_start": query_start,
+                    "query_end": query_end,
+                    "M": M,
+                    "N": N,
+                    "top_k": top_k,
+                    "dcp_world_size": self.dcp_world_size,
+                    "dcp_rank": self.dcp_rank,
+                    "total_cp_world_size": self.total_cp_world_size,
+                    "total_cp_rank": self.total_cp_rank,
+                    "cp_kv_cache_interleave_size": self.cp_kv_cache_interleave_size,
                     "padded_local_heads": padded_local_heads,
                 },
             )
