@@ -31,6 +31,7 @@ from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.parallel_state import (
     get_dcp_group,
+    get_pcp_group,
     get_pp_group,
     prepare_communication_buffer_for_model,
 )
@@ -46,7 +47,11 @@ from vllm.tasks import SupportedTask
 from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_cache_interface import (
+    KVCacheConfig,
+    get_kv_cache_spec_total_cp_rank,
+    get_kv_cache_spec_total_cp_world_size,
+)
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
 from vllm.v1.worker.gpu.async_utils import AsyncOutput, AsyncPoolingOutput
@@ -340,6 +345,26 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             kv_cache_group.kv_cache_spec.block_size
             for kv_cache_group in kv_cache_config.kv_cache_groups
         ]
+        pcp_size = self.parallel_config.prefill_context_parallel_size
+        pcp_rank = get_pcp_group().rank_in_group if pcp_size > 1 else 0
+        cp_sizes = [
+            get_kv_cache_spec_total_cp_world_size(
+                kv_cache_group.kv_cache_spec,
+                self.dcp_size,
+                pcp_size,
+            )
+            for kv_cache_group in kv_cache_config.kv_cache_groups
+        ]
+        cp_ranks = [
+            get_kv_cache_spec_total_cp_rank(
+                kv_cache_group.kv_cache_spec,
+                self.dcp_size,
+                self.dcp_rank,
+                pcp_size,
+                pcp_rank,
+            )
+            for kv_cache_group in kv_cache_config.kv_cache_groups
+        ]
 
         block_table_max_model_len = self.max_model_len
         if self.is_encoder_decoder:
@@ -359,6 +384,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             cp_size=self.dcp_size,
             cp_rank=self.dcp_rank,
             cp_interleave=self.cp_interleave,
+            cp_sizes=cp_sizes,
+            cp_ranks=cp_ranks,
         )
 
         self.attn_backends, self.attn_groups, attn_cg_support = init_attn_backend(

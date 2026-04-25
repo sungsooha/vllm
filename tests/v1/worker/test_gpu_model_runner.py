@@ -1031,6 +1031,30 @@ def test_hybrid_block_table_initialization():
     )
 
 
+def test_multigroup_block_table_uses_per_group_cp_policy():
+    from vllm.v1.worker.block_table import MultiGroupBlockTable
+
+    block_table = MultiGroupBlockTable(
+        max_num_reqs=2,
+        max_model_len=64,
+        max_num_batched_tokens=16,
+        pin_memory=False,
+        device=torch.device(DEVICE_TYPE),
+        block_sizes=[4, 4],
+        kernel_block_sizes=[4, 4],
+        total_cp_world_sizes=[1, 4],
+        total_cp_ranks=[0, 2],
+    )
+
+    transparent_group, sharded_group = block_table.block_tables
+    assert transparent_group.max_num_blocks_per_req == 16
+    assert transparent_group.total_cp_world_size == 1
+    assert transparent_group.total_cp_rank == 0
+    assert sharded_group.max_num_blocks_per_req == 4
+    assert sharded_group.total_cp_world_size == 4
+    assert sharded_group.total_cp_rank == 2
+
+
 def test_input_batch_with_kernel_block_sizes():
     """Test InputBatch initialization with kernel_block_sizes parameter."""
     max_num_reqs = 10
