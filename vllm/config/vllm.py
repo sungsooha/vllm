@@ -1771,10 +1771,14 @@ class VllmConfig:
                 f"(got {self.parallel_config.prefill_context_parallel_size})"
             )
 
-        if self.cache_config.enable_prefix_caching:
+        if (
+            self.cache_config.enable_prefix_caching
+            and not envs.VLLM_ENABLE_DEEPSEEK_V4_DCP_PREFIX_CACHE
+        ):
             unsupported.append(
                 "prefix caching must be disabled for the initial DCP MVP "
-                "(use --no-enable-prefix-caching)"
+                "(use --no-enable-prefix-caching), unless "
+                "VLLM_ENABLE_DEEPSEEK_V4_DCP_PREFIX_CACHE=1 is set"
             )
 
         if self.speculative_config is not None:
@@ -1797,8 +1801,9 @@ class VllmConfig:
                 "DeepSeek V4 decode context parallelism is gated for the "
                 "Helix MVP. Required combination: "
                 "decode_context_parallel_size > 1, dcp_comm_backend='a2a', "
-                "prefill_context_parallel_size=1, prefix caching disabled, "
-                "no speculative decoding/MTP, and CUDA graphs disabled unless "
+                "prefill_context_parallel_size=1, prefix caching disabled unless "
+                "VLLM_ENABLE_DEEPSEEK_V4_DCP_PREFIX_CACHE=1, no speculative "
+                "decoding/MTP, and CUDA graphs disabled unless "
                 "VLLM_ENABLE_DEEPSEEK_V4_DCP_CUDAGRAPH=1. Unsupported current "
                 "settings: " + "; ".join(unsupported)
             )
