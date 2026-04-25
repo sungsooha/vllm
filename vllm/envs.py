@@ -92,6 +92,7 @@ if TYPE_CHECKING:
     VERBOSE: bool = False
     VLLM_ALLOW_LONG_MAX_MODEL_LEN: bool = False
     VLLM_ENABLE_DEEPSEEK_V4_DCP: bool = False
+    VLLM_ENABLE_DEEPSEEK_V4_DCP_PREFIX_CACHE: bool = False
     VLLM_RPC_TIMEOUT: int = 10000  # ms
     VLLM_HTTP_TIMEOUT_KEEP_ALIVE: int = 5  # seconds
     VLLM_MAX_N_SEQUENCES: int = 16384
@@ -913,6 +914,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # stay opt-in until the V4-specific KV-cache and attention paths are DCP-safe.
     "VLLM_ENABLE_DEEPSEEK_V4_DCP": lambda: (
         os.environ.get("VLLM_ENABLE_DEEPSEEK_V4_DCP", "0").strip().lower()
+        in ("1", "true")
+    ),
+    # Additional opt-in for testing DeepSeek V4 DCP with prefix caching.
+    # Prefix-cache correctness depends on DCP-aware hybrid/sliding-window
+    # KV-cache lookup and should remain separate from the base DCP guard.
+    "VLLM_ENABLE_DEEPSEEK_V4_DCP_PREFIX_CACHE": lambda: (
+        os.environ.get("VLLM_ENABLE_DEEPSEEK_V4_DCP_PREFIX_CACHE", "0").strip().lower()
         in ("1", "true")
     ),
     # Additional opt-in for testing DeepSeek V4 DCP with CUDA graphs. The first

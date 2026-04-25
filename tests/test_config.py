@@ -153,6 +153,7 @@ def test_deepseek_v4_dcp_guard_requires_feature_flag(monkeypatch):
 
 def test_deepseek_v4_dcp_guard_rejects_unsupported_mvp_options(monkeypatch):
     monkeypatch.setenv("VLLM_ENABLE_DEEPSEEK_V4_DCP", "1")
+    monkeypatch.delenv("VLLM_ENABLE_DEEPSEEK_V4_DCP_PREFIX_CACHE", raising=False)
     cfg = _deepseek_v4_dcp_test_config(enforce_eager=False)
     cfg.parallel_config = ParallelConfig(
         tensor_parallel_size=2,
@@ -169,6 +170,15 @@ def test_deepseek_v4_dcp_guard_rejects_unsupported_mvp_options(monkeypatch):
     assert "dcp_comm_backend must be 'a2a'" in message
     assert "prefix caching must be disabled" in message
     assert "VLLM_ENABLE_DEEPSEEK_V4_DCP_CUDAGRAPH=1" in message
+
+
+def test_deepseek_v4_dcp_guard_allows_prefix_cache_opt_in(monkeypatch):
+    monkeypatch.setenv("VLLM_ENABLE_DEEPSEEK_V4_DCP", "1")
+    monkeypatch.setenv("VLLM_ENABLE_DEEPSEEK_V4_DCP_PREFIX_CACHE", "1")
+    cfg = _deepseek_v4_dcp_test_config()
+    cfg.cache_config.enable_prefix_caching = True
+
+    cfg._validate_deepseek_v4_dcp()
 
 
 def test_deepseek_v4_dcp_guard_allows_explicit_mvp_config(monkeypatch):

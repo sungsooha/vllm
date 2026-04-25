@@ -1895,6 +1895,18 @@ def new_deepseek_v4_swa_spec(block_size=64, sliding_window=256):
     )
 
 
+def new_deepseek_v4_transparent_swa_spec(block_size=4, sliding_window=8):
+    return SlidingWindowMLASpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=2304,
+        dtype=torch.float32,
+        sliding_window=sliding_window,
+        alignment=576,
+        dcp_transparent=True,
+    )
+
+
 def test_merge_mla_spec():
     kv_cache_specs = [
         new_mla_spec(),
@@ -1972,7 +1984,8 @@ def test_resolve_kv_cache_block_sizes_deepseek_v4_dcp_no_prefix():
     assert hash_block_size == 512
 
 
-def test_resolve_kv_cache_block_sizes_deepseek_v4_dcp_rejects_prefix():
+def test_resolve_kv_cache_block_sizes_deepseek_v4_dcp_rejects_prefix(monkeypatch):
+    monkeypatch.delenv("VLLM_ENABLE_DEEPSEEK_V4_DCP_PREFIX_CACHE", raising=False)
     kv_cache_config = KVCacheConfig(
         num_blocks=10,
         kv_cache_tensors=[],
@@ -1985,6 +1998,38 @@ def test_resolve_kv_cache_block_sizes_deepseek_v4_dcp_rejects_prefix():
 
     with pytest.raises(ValueError, match="sliding-window MLA"):
         kv_cache_utils.resolve_kv_cache_block_sizes(kv_cache_config, vllm_config)
+
+
+def test_resolve_kv_cache_block_sizes_deepseek_v4_dcp_allows_prefix_opt_in(
+    monkeypatch,
+):
+    monkeypatch.setenv("VLLM_ENABLE_DEEPSEEK_V4_DCP_PREFIX_CACHE", "1")
+    kv_cache_config = KVCacheConfig(
+        num_blocks=10,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["mla"], new_deepseek_v4_mla_spec(block_size=256)),
+            KVCacheGroupSpec(["swa0"], new_deepseek_v4_swa_spec(block_size=64)),
+            KVCacheGroupSpec(["swa1"], new_deepseek_v4_swa_spec(block_size=64)),
+            KVCacheGroupSpec(
+                ["compressor"],
+                new_deepseek_v4_transparent_swa_spec(block_size=4),
+            ),
+            KVCacheGroupSpec(
+                ["selector"],
+                new_deepseek_v4_transparent_swa_spec(block_size=8),
+            ),
+        ],
+    )
+    vllm_config = _dcp_block_size_test_config(dcp=4, prefix_caching=True)
+
+    scheduler_block_size, hash_block_size = kv_cache_utils.resolve_kv_cache_block_sizes(
+        kv_cache_config,
+        vllm_config,
+    )
+
+    assert scheduler_block_size == 1024
+    assert hash_block_size == 4
 
 
 def test_resolve_kv_cache_block_sizes_dcp_keeps_mamba_transparent():

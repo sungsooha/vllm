@@ -624,6 +624,12 @@ def resolve_kv_cache_block_sizes(
             type(g.kv_cache_spec).__name__
             for g in groups
             if isinstance(g.kv_cache_spec, SlidingWindowMLASpec)
+            and not (
+                get_kv_cache_spec_dcp_policy(g.kv_cache_spec) != "unsupported"
+                and cache_config.enable_prefix_caching
+                and not connector_enabled
+                and envs.VLLM_ENABLE_DEEPSEEK_V4_DCP_PREFIX_CACHE
+            )
         ]
         if unsafe_specs:
             raise ValueError(
