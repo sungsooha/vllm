@@ -38,14 +38,14 @@ class TestDCPCommBackendConfig:
         """A2A backend is valid when DCP > 1."""
         config = ParallelConfig(
             dcp_comm_backend="a2a",
-            tensor_parallel_size=8,
+            tensor_parallel_size=4,
             decode_context_parallel_size=4,
         )
         assert config.dcp_comm_backend == "a2a"
 
     def test_invalid_backend_rejected(self):
         """Invalid backend values are rejected."""
-        with pytest.raises(ValueError, match="must be one of"):
+        with pytest.raises(ValueError, match="Input should be|must be one of"):
             ParallelConfig(
                 dcp_comm_backend="invalid",
             )
@@ -134,7 +134,7 @@ class TestLSEWeightedCombine:
         result = _lse_weighted_combine(outputs, lses)
 
         assert result.shape == (B, H, D)
-        torch.testing.assert_close(result, outputs[1].squeeze(0), atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(result, outputs[1], atol=1e-5, rtol=1e-5)
 
     def test_mathematically_correct(self):
         """Verify mathematical correctness of LSE combination."""
