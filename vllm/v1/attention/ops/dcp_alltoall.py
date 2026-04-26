@@ -380,6 +380,399 @@ def dcp_lse_combine_triton(
     return out
 
 
+def _dcp_a2a_lse_pack_dim(output_dtype: torch.dtype) -> int:
+    """Number of output-dtype slots needed to bit-pack one fp32 LSE value."""
+    bits = torch.finfo(output_dtype).bits
+    if bits > 32 or 32 % bits != 0:
+        raise ValueError(f"Cannot pack fp32 LSE into output dtype {output_dtype}.")
+    return 32 // bits
+
+
+@triton.jit
+def _dcp_a2a_pack_send_kernel(
+    # Input: output [B, H, D] and LSE [B, H]
+    out_ptr,
+    lse_ptr,
+    # Output: packed send buffer [N, B, H_per_rank, D + LSE_PACK_DIM]
+    send_ptr,
+    # Strides for output [B, H, D]
+    out_stride_B,
+    out_stride_H,
+    out_stride_D,
+    # Strides for LSE [B, H]
+    lse_stride_B,
+    lse_stride_H,
+    # Strides for send buffer [N, B, H_per_rank, D + LSE_PACK_DIM]
+    send_stride_N,
+    send_stride_B,
+    send_stride_H,
+    send_stride_D,
+    # Constants
+    N: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    H_PER_RANK: tl.constexpr,
+    LSE_PACK_DIM: tl.constexpr,
+):
+    """
+    Fused pack for DCP A2A.
+
+    Converts output [B, H, D] and fp32 LSE [B, H] into a single buffer
+    [N, B, H/N, D + LSE_PACK_DIM]. For bf16/fp16 output, fp32 LSE is stored
+    as two raw 16-bit halves in the output dtype lanes.
+    """
+    batch_idx = tl.program_id(0).to(tl.int64)
+    local_head_idx = tl.program_id(1).to(tl.int64)
+    d_offsets = tl.arange(0, HEAD_DIM)
+
+    for rank_idx in tl.static_range(N):
+        src_head_idx = rank_idx * H_PER_RANK + local_head_idx
+        send_base = (
+            rank_idx * send_stride_N
+            + batch_idx * send_stride_B
+            + local_head_idx * send_stride_H
+        )
+
+        out_offsets = (
+            batch_idx * out_stride_B
+            + src_head_idx * out_stride_H
+            + d_offsets * out_stride_D
+        )
+        out_vals = tl.load(out_ptr + out_offsets)
+        tl.store(send_ptr + send_base + d_offsets * send_stride_D, out_vals)
+
+        lse_offset = batch_idx * lse_stride_B + src_head_idx * lse_stride_H
+        lse_val = tl.load(lse_ptr + lse_offset)
+
+        if LSE_PACK_DIM == 1:
+            tl.store(
+                send_ptr + send_base + HEAD_DIM * send_stride_D,
+                lse_val.to(send_ptr.dtype.element_ty),
+            )
+        else:
+            lse_bits = lse_val.to(tl.uint32, bitcast=True)
+            lo = (lse_bits & 0xFFFF).to(tl.uint16)
+            hi = ((lse_bits >> 16) & 0xFFFF).to(tl.uint16)
+            tl.store(
+                send_ptr + send_base + HEAD_DIM * send_stride_D,
+                lo.to(send_ptr.dtype.element_ty, bitcast=True),
+            )
+            tl.store(
+                send_ptr + send_base + (HEAD_DIM + 1) * send_stride_D,
+                hi.to(send_ptr.dtype.element_ty, bitcast=True),
+            )
+
+
+@triton.jit
+def _dcp_a2a_fused_unpack_combine_kernel(
+    # Input: packed recv buffer [N, B, H_per_rank, D + LSE_PACK_DIM]
+    recv_ptr,
+    # Output: combined output [B, H_per_rank, D] and optional global LSE
+    out_ptr,
+    out_lse_ptr,
+    # Strides for recv buffer [N, B, H_per_rank, D + LSE_PACK_DIM]
+    recv_stride_N,
+    recv_stride_B,
+    recv_stride_H,
+    recv_stride_D,
+    # Strides for output [B, H_per_rank, D]
+    out_stride_B,
+    out_stride_H,
+    out_stride_D,
+    # Strides for output LSE [B, H_per_rank]
+    out_lse_stride_B,
+    out_lse_stride_H,
+    # Constants
+    N: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    IS_BASE_E: tl.constexpr,
+    RETURN_LSE: tl.constexpr,
+    LSE_PACK_DIM: tl.constexpr,
+):
+    """
+    Fused unpack plus LSE-weighted combine for packed DCP A2A.
+
+    Reads output lanes and bit-packed fp32 LSE directly from the packed receive
+    buffer. This preserves the global LSE return contract required by DSV4's
+    attention sink.
+    """
+    batch_idx = tl.program_id(0).to(tl.int64)
+    head_idx = tl.program_id(1).to(tl.int64)
+    d_offsets = tl.arange(0, HEAD_DIM)
+
+    lse_max = -float("inf")
+    for rank_idx in tl.static_range(N):
+        recv_base = (
+            rank_idx * recv_stride_N
+            + batch_idx * recv_stride_B
+            + head_idx * recv_stride_H
+        )
+        if LSE_PACK_DIM == 1:
+            lse_val = tl.load(recv_ptr + recv_base + HEAD_DIM * recv_stride_D).to(
+                tl.float32
+            )
+        else:
+            lo_raw = tl.load(recv_ptr + recv_base + HEAD_DIM * recv_stride_D)
+            hi_raw = tl.load(recv_ptr + recv_base + (HEAD_DIM + 1) * recv_stride_D)
+            lo = lo_raw.to(tl.uint16, bitcast=True).to(tl.uint32)
+            hi = hi_raw.to(tl.uint16, bitcast=True).to(tl.uint32)
+            lse_val = (lo | (hi << 16)).to(tl.float32, bitcast=True)
+
+        lse_val = tl.where(
+            (lse_val != lse_val) | (lse_val == float("inf")),
+            -float("inf"),
+            lse_val,
+        )
+        lse_max = tl.maximum(lse_max, lse_val)
+
+    lse_max = tl.where(lse_max == -float("inf"), 0.0, lse_max)
+
+    lse_sum = 0.0
+    for rank_idx in tl.static_range(N):
+        recv_base = (
+            rank_idx * recv_stride_N
+            + batch_idx * recv_stride_B
+            + head_idx * recv_stride_H
+        )
+        if LSE_PACK_DIM == 1:
+            lse_val = tl.load(recv_ptr + recv_base + HEAD_DIM * recv_stride_D).to(
+                tl.float32
+            )
+        else:
+            lo_raw = tl.load(recv_ptr + recv_base + HEAD_DIM * recv_stride_D)
+            hi_raw = tl.load(recv_ptr + recv_base + (HEAD_DIM + 1) * recv_stride_D)
+            lo = lo_raw.to(tl.uint16, bitcast=True).to(tl.uint32)
+            hi = hi_raw.to(tl.uint16, bitcast=True).to(tl.uint32)
+            lse_val = (lo | (hi << 16)).to(tl.float32, bitcast=True)
+
+        lse_val = tl.where(
+            (lse_val != lse_val) | (lse_val == float("inf")),
+            -float("inf"),
+            lse_val,
+        )
+        if IS_BASE_E:
+            lse_sum += tl.exp(lse_val - lse_max)
+        else:
+            lse_sum += tl.exp2(lse_val - lse_max)
+
+    if IS_BASE_E:  # noqa: SIM108
+        global_lse = tl.log(lse_sum) + lse_max
+    else:
+        global_lse = tl.log2(lse_sum) + lse_max
+
+    acc = tl.zeros([HEAD_DIM], dtype=tl.float32)
+    for rank_idx in tl.static_range(N):
+        recv_base = (
+            rank_idx * recv_stride_N
+            + batch_idx * recv_stride_B
+            + head_idx * recv_stride_H
+        )
+        if LSE_PACK_DIM == 1:
+            lse_val = tl.load(recv_ptr + recv_base + HEAD_DIM * recv_stride_D).to(
+                tl.float32
+            )
+        else:
+            lo_raw = tl.load(recv_ptr + recv_base + HEAD_DIM * recv_stride_D)
+            hi_raw = tl.load(recv_ptr + recv_base + (HEAD_DIM + 1) * recv_stride_D)
+            lo = lo_raw.to(tl.uint16, bitcast=True).to(tl.uint32)
+            hi = hi_raw.to(tl.uint16, bitcast=True).to(tl.uint32)
+            lse_val = (lo | (hi << 16)).to(tl.float32, bitcast=True)
+
+        lse_val = tl.where(
+            (lse_val != lse_val) | (lse_val == float("inf")),
+            -float("inf"),
+            lse_val,
+        )
+        if IS_BASE_E:
+            weight = tl.exp(lse_val - global_lse)
+        else:
+            weight = tl.exp2(lse_val - global_lse)
+        weight = tl.where(weight != weight, 0.0, weight)
+
+        out_offsets = recv_base + d_offsets * recv_stride_D
+        out_vals = tl.load(recv_ptr + out_offsets).to(tl.float32)
+        acc += out_vals * weight
+
+    final_offsets = (
+        batch_idx * out_stride_B + head_idx * out_stride_H + d_offsets * out_stride_D
+    )
+    tl.store(out_ptr + final_offsets, acc)
+
+    if RETURN_LSE:
+        out_lse_offset = batch_idx * out_lse_stride_B + head_idx * out_lse_stride_H
+        tl.store(out_lse_ptr + out_lse_offset, global_lse)
+
+
+def _dcp_a2a_pack_send_triton(
+    cp_attn_out: torch.Tensor,
+    cp_attn_lse: torch.Tensor,
+    send_combined: torch.Tensor,
+    world_size: int,
+    H_per_rank: int,
+    D: int,
+    lse_pack_dim: int,
+) -> None:
+    B = cp_attn_out.shape[0]
+    grid = (B, H_per_rank, 1)
+    _dcp_a2a_pack_send_kernel[grid](
+        cp_attn_out,
+        cp_attn_lse,
+        send_combined,
+        cp_attn_out.stride(0),
+        cp_attn_out.stride(1),
+        cp_attn_out.stride(2),
+        cp_attn_lse.stride(0),
+        cp_attn_lse.stride(1),
+        send_combined.stride(0),
+        send_combined.stride(1),
+        send_combined.stride(2),
+        send_combined.stride(3),
+        N=world_size,
+        HEAD_DIM=D,
+        H_PER_RANK=H_per_rank,
+        LSE_PACK_DIM=lse_pack_dim,
+    )
+
+
+def _dcp_a2a_fused_unpack_combine_triton(
+    recv_combined: torch.Tensor,
+    head_dim: int,
+    lse_pack_dim: int,
+    return_lse: bool = False,
+    is_lse_base_on_e: bool = True,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    N, B, H_per_rank, _ = recv_combined.shape
+    out = torch.empty(
+        (B, H_per_rank, head_dim),
+        device=recv_combined.device,
+        dtype=recv_combined.dtype,
+    )
+    if return_lse:
+        out_lse = torch.empty(
+            (B, H_per_rank), device=recv_combined.device, dtype=torch.float32
+        )
+    else:
+        out_lse = torch.empty((1, 1), device=recv_combined.device, dtype=torch.float32)
+
+    grid = (B, H_per_rank, 1)
+    _dcp_a2a_fused_unpack_combine_kernel[grid](
+        recv_combined,
+        out,
+        out_lse,
+        recv_combined.stride(0),
+        recv_combined.stride(1),
+        recv_combined.stride(2),
+        recv_combined.stride(3),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        out_lse.stride(0),
+        out_lse.stride(1),
+        N=N,
+        HEAD_DIM=head_dim,
+        IS_BASE_E=is_lse_base_on_e,
+        RETURN_LSE=return_lse,
+        LSE_PACK_DIM=lse_pack_dim,
+    )
+
+    if return_lse:
+        return out, out_lse
+    return out
+
+
+def dcp_a2a_lse_reduce_packed(
+    cp_attn_out: torch.Tensor,
+    cp_attn_lse: torch.Tensor,
+    cp_group: GroupCoordinator,
+    ctx: CPTritonContext | None = None,
+    return_lse: bool = False,
+    is_lse_base_on_e: bool = True,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """
+    Experimental packed DCP A2A path.
+
+    Packs attention output and fp32 LSE into one output-dtype buffer, exchanges it
+    with one all_to_all_single, then fuses LSE unpack and global LSE combine.
+    """
+    del ctx
+    world_size = cp_group.world_size
+    if world_size == 1:
+        if return_lse:
+            return cp_attn_out, cp_attn_lse
+        return cp_attn_out
+
+    B, H, D = cp_attn_out.shape
+    if H % world_size != 0:
+        raise ValueError(f"H={H} must be divisible by DCP world size {world_size}.")
+    H_per_rank = H // world_size
+    lse_pack_dim = _dcp_a2a_lse_pack_dim(cp_attn_out.dtype)
+
+    profile = _dcp_a2a_profile_enabled()
+    profile_sync = profile and envs.VLLM_DCP_A2A_PROFILE_SYNC
+
+    timings_ms: dict[str, float] = {"copy": 0.0, "wait_lse": 0.0}
+    t_total = _dcp_a2a_mark(profile_sync) if profile else 0.0
+
+    t0 = _dcp_a2a_mark(profile_sync) if profile else 0.0
+    send_combined = torch.empty(
+        (world_size, B, H_per_rank, D + lse_pack_dim),
+        device=cp_attn_out.device,
+        dtype=cp_attn_out.dtype,
+    )
+    recv_combined = torch.empty_like(send_combined)
+    _dcp_a2a_pack_send_triton(
+        cp_attn_out,
+        cp_attn_lse,
+        send_combined,
+        world_size,
+        H_per_rank,
+        D,
+        lse_pack_dim,
+    )
+    if profile:
+        t1 = _dcp_a2a_mark(profile_sync)
+        timings_ms["pack"] = (t1 - t0) * 1000.0
+
+    t0 = time.perf_counter() if profile else 0.0
+    work = dist.all_to_all_single(
+        recv_combined.view(-1),
+        send_combined.view(-1),
+        group=cp_group.device_group,
+        async_op=True,
+    )
+    if profile:
+        t1 = time.perf_counter()
+        timings_ms["a2a_enqueue"] = (t1 - t0) * 1000.0
+
+    t0 = time.perf_counter() if profile else 0.0
+    work.wait()
+    if profile:
+        t1 = _dcp_a2a_mark(profile_sync)
+        timings_ms["wait_output"] = (t1 - t0) * 1000.0
+
+    t0 = _dcp_a2a_mark(profile_sync) if profile else 0.0
+    result = _dcp_a2a_fused_unpack_combine_triton(
+        recv_combined,
+        D,
+        lse_pack_dim,
+        return_lse=return_lse,
+        is_lse_base_on_e=is_lse_base_on_e,
+    )
+    if profile:
+        t1 = _dcp_a2a_mark(profile_sync)
+        timings_ms["combine"] = (t1 - t0) * 1000.0
+        timings_ms["total"] = (t1 - t_total) * 1000.0
+        profile_key = (world_size, B, H, D, return_lse, is_lse_base_on_e)
+        _dcp_a2a_profile_record(
+            cp_group,
+            profile_key,
+            timings_ms,
+            bytes_output=send_combined.numel() * send_combined.element_size(),
+            bytes_lse=0,
+        )
+
+    return result
+
+
 def dcp_a2a_lse_reduce(
     cp_attn_out: torch.Tensor,
     cp_attn_lse: torch.Tensor,
@@ -421,6 +814,16 @@ def dcp_a2a_lse_reduce(
         if return_lse:
             return cp_attn_out, cp_attn_lse
         return cp_attn_out
+
+    if envs.VLLM_DCP_A2A_PACKED:
+        return dcp_a2a_lse_reduce_packed(
+            cp_attn_out,
+            cp_attn_lse,
+            cp_group,
+            ctx=ctx,
+            return_lse=return_lse,
+            is_lse_base_on_e=is_lse_base_on_e,
+        )
 
     profile = _dcp_a2a_profile_enabled()
     profile_sync = profile and envs.VLLM_DCP_A2A_PROFILE_SYNC

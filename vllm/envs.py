@@ -1607,6 +1607,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Profile DCP A2A attention communication. This is intended for targeted
     # debug/profiling runs only; enabling synchronization changes timing.
     "VLLM_DCP_A2A_PROFILE": lambda: bool(int(os.getenv("VLLM_DCP_A2A_PROFILE", "0"))),
+    # Use the experimental packed DCP A2A path, which packs attention output
+    # and fp32 LSE into one buffer and uses one all_to_all_single collective.
+    "VLLM_DCP_A2A_PACKED": lambda: bool(int(os.getenv("VLLM_DCP_A2A_PACKED", "0"))),
     # Log DCP A2A profile summaries every N calls per worker.
     "VLLM_DCP_A2A_PROFILE_INTERVAL": lambda: int(
         os.getenv("VLLM_DCP_A2A_PROFILE_INTERVAL", "100")
