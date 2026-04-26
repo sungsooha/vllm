@@ -259,6 +259,11 @@ if TYPE_CHECKING:
     VLLM_ELASTIC_EP_SCALE_UP_LAUNCH: bool = False
     VLLM_ELASTIC_EP_DRAIN_REQUESTS: bool = False
     VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS: bool = False
+    VLLM_DSV4_DCP_LAYER_PROFILE: bool = False
+    VLLM_DSV4_DCP_LAYER_PROFILE_INTERVAL: int = 100
+    VLLM_DSV4_DCP_LAYER_PROFILE_WARMUP: int = 10
+    VLLM_DSV4_DCP_LAYER_PROFILE_SYNC: bool = True
+    VLLM_DSV4_DCP_LAYER_PROFILE_ALL_RANKS: bool = False
     VLLM_NIXL_EP_MAX_NUM_RANKS: int = 32
     VLLM_XPU_ENABLE_XPU_GRAPH: bool = False
     VLLM_LORA_ENABLE_DUAL_STREAM: bool = False
@@ -1617,6 +1622,27 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Log DCP A2A summaries from every DCP rank instead of rank 0 only.
     "VLLM_DCP_A2A_PROFILE_ALL_RANKS": lambda: bool(
         int(os.getenv("VLLM_DCP_A2A_PROFILE_ALL_RANKS", "0"))
+    ),
+    # Profile DeepSeek V4 DCP attention at the layer level. This is intended for
+    # targeted debug/profiling runs only; enabling synchronization changes timing.
+    "VLLM_DSV4_DCP_LAYER_PROFILE": lambda: bool(
+        int(os.getenv("VLLM_DSV4_DCP_LAYER_PROFILE", "0"))
+    ),
+    # Log DeepSeek V4 DCP layer profile summaries every N calls per worker.
+    "VLLM_DSV4_DCP_LAYER_PROFILE_INTERVAL": lambda: int(
+        os.getenv("VLLM_DSV4_DCP_LAYER_PROFILE_INTERVAL", "100")
+    ),
+    # Skip the first N calls before accumulating DSV4 DCP layer profile summaries.
+    "VLLM_DSV4_DCP_LAYER_PROFILE_WARMUP": lambda: int(
+        os.getenv("VLLM_DSV4_DCP_LAYER_PROFILE_WARMUP", "10")
+    ),
+    # Synchronize around DSV4 DCP layer profiling regions for stable timings.
+    "VLLM_DSV4_DCP_LAYER_PROFILE_SYNC": lambda: bool(
+        int(os.getenv("VLLM_DSV4_DCP_LAYER_PROFILE_SYNC", "1"))
+    ),
+    # Log DSV4 DCP layer summaries from every DCP rank instead of rank 0 only.
+    "VLLM_DSV4_DCP_LAYER_PROFILE_ALL_RANKS": lambda: bool(
+        int(os.getenv("VLLM_DSV4_DCP_LAYER_PROFILE_ALL_RANKS", "0"))
     ),
     # Represent block hashes in KV cache events as 64-bit integers instead of
     # raw bytes. Defaults to True for backward compatibility.

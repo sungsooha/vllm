@@ -5,7 +5,8 @@ DeepseekV4 MLA Attention Layer
 """
 
 import os
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import torch
@@ -13,6 +14,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import DeepseekV2Config, DeepseekV3Config
 
+from vllm import envs
 from vllm.model_executor.layers.linear import (
     ReplicatedLinear,
 )
@@ -89,6 +91,96 @@ logger = init_logger(__name__)
 # workspace allocated at _forward_prefill (and the matching profile-time
 # reservation in attention_impl's dummy-run branch).
 PREFILL_CHUNK_SIZE = 4
+
+
+@dataclass
+class _DSV4DCPProfileStats:
+    calls: int = 0
+    skipped_warmup: int = 0
+    totals_ms: dict[str, float] = field(default_factory=dict)
+
+    def add(self, timings_ms: dict[str, float]) -> None:
+        self.calls += 1
+        for key, value in timings_ms.items():
+            self.totals_ms[key] = self.totals_ms.get(key, 0.0) + value
+
+    def avg(self, key: str) -> float:
+        if self.calls == 0:
+            return 0.0
+        return self.totals_ms.get(key, 0.0) / self.calls
+
+
+_DSV4_DCP_LAYER_PROFILE_STATS: dict[
+    tuple[int, str, int, int, int, int], _DSV4DCPProfileStats
+] = {}
+
+
+def _dsv4_dcp_layer_profile_enabled() -> bool:
+    return bool(envs.VLLM_DSV4_DCP_LAYER_PROFILE)
+
+
+def _dsv4_dcp_layer_profile_should_log_rank(dcp_rank: int) -> bool:
+    if envs.VLLM_DSV4_DCP_LAYER_PROFILE_ALL_RANKS:
+        return True
+    return dcp_rank == 0
+
+
+def _dsv4_dcp_layer_profile_mark(sync: bool) -> float:
+    if sync:
+        torch.accelerator.synchronize()
+    return time.perf_counter()
+
+
+def _dsv4_dcp_layer_profile_record(
+    *,
+    dcp_rank: int,
+    layer_idx: int,
+    mode: str,
+    compress_ratio: int,
+    B: int,
+    H: int,
+    D: int,
+    timings_ms: dict[str, float],
+) -> None:
+    key = (layer_idx, mode, compress_ratio, B, H, D)
+    stats = _DSV4_DCP_LAYER_PROFILE_STATS.setdefault(key, _DSV4DCPProfileStats())
+    warmup = max(envs.VLLM_DSV4_DCP_LAYER_PROFILE_WARMUP, 0)
+    if stats.skipped_warmup < warmup:
+        stats.skipped_warmup += 1
+        return
+
+    stats.add(timings_ms)
+    interval = max(envs.VLLM_DSV4_DCP_LAYER_PROFILE_INTERVAL, 1)
+    if stats.calls % interval != 0 or not _dsv4_dcp_layer_profile_should_log_rank(
+        dcp_rank
+    ):
+        return
+
+    logger.info(
+        "DSV4_DCP_LAYER_PROFILE rank=%d layer=%d mode=%s "
+        "compress_ratio=%d shape=B%d_H%d_D%d calls=%d warmup=%d sync=%s "
+        "avg_ms(q_gather=%.3f,flash=%.3f,normalize=%.3f,"
+        "a2a_reduce=%.3f,sink_scale=%.3f,output_copy=%.3f,"
+        "sink_copy=%.3f,total=%.3f)",
+        dcp_rank,
+        layer_idx,
+        mode,
+        compress_ratio,
+        B,
+        H,
+        D,
+        stats.calls,
+        stats.skipped_warmup,
+        envs.VLLM_DSV4_DCP_LAYER_PROFILE_SYNC,
+        stats.avg("q_gather"),
+        stats.avg("flash"),
+        stats.avg("normalize"),
+        stats.avg("a2a_reduce"),
+        stats.avg("sink_scale"),
+        stats.avg("output_copy"),
+        stats.avg("sink_scale") + stats.avg("output_copy"),
+        stats.avg("total"),
+    )
 
 
 def _get_dcp_padded_head_counts(
@@ -932,13 +1024,20 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         partial_lse: torch.Tensor,
         output: torch.Tensor,
         padded_local_heads: int,
+        profile_timings_ms: dict[str, float] | None = None,
     ) -> None:
+        profile = profile_timings_ms is not None
+        profile_sync = profile and envs.VLLM_DSV4_DCP_LAYER_PROFILE_SYNC
+        t0 = _dsv4_dcp_layer_profile_mark(profile_sync) if profile else 0.0
         combined_out, combined_lse = self.dcp_combine(
             partial_out,
             partial_lse,
             get_dcp_group(),
             return_lse=True,
         )
+        if profile_timings_ms is not None:
+            t1 = _dsv4_dcp_layer_profile_mark(profile_sync)
+            profile_timings_ms["a2a_reduce"] = (t1 - t0) * 1000.0
         assert combined_out.shape == (
             output.shape[0],
             padded_local_heads,
@@ -952,11 +1051,15 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         # must be applied once after the global LSE is known.
         combined_out_pre_sink = combined_out
         attn_sink = self.attn_sink[:padded_local_heads]
+        t0 = _dsv4_dcp_layer_profile_mark(profile_sync) if profile else 0.0
         combined_out = _apply_attn_sink_with_lse(
             combined_out_pre_sink,
             combined_lse,
             attn_sink,
         )
+        if profile_timings_ms is not None:
+            t1 = _dsv4_dcp_layer_profile_mark(profile_sync)
+            profile_timings_ms["sink_scale"] = (t1 - t0) * 1000.0
         dsv4_debug_dump(
             "attn.dcp_lse_combine",
             layer_idx=self.debug_layer_idx,
@@ -978,7 +1081,11 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 "head_chunk_end": (self.dcp_rank + 1) * padded_local_heads,
             },
         )
+        t0 = _dsv4_dcp_layer_profile_mark(profile_sync) if profile else 0.0
         output[:, :padded_local_heads, :].copy_(combined_out)
+        if profile_timings_ms is not None:
+            t1 = _dsv4_dcp_layer_profile_mark(profile_sync)
+            profile_timings_ms["output_copy"] = (t1 - t0) * 1000.0
 
     def _forward_decode(
         self,
@@ -991,6 +1098,10 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
     ) -> None:
         num_decodes = swa_metadata.num_decodes
         num_decode_tokens = swa_metadata.num_decode_tokens
+        profile = self.dcp_world_size > 1 and _dsv4_dcp_layer_profile_enabled()
+        profile_sync = profile and envs.VLLM_DSV4_DCP_LAYER_PROFILE_SYNC
+        profile_timings_ms: dict[str, float] = {}
+        t_total = _dsv4_dcp_layer_profile_mark(profile_sync) if profile else 0.0
 
         topk_indices = None
         topk_lens = None
@@ -1022,7 +1133,11 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         # query heads across the DCP group before FlashMLA; the cross-rank LSE
         # combine scatters the result back to this rank's local heads.
         if self.dcp_world_size > 1:
+            t0 = _dsv4_dcp_layer_profile_mark(profile_sync) if profile else 0.0
             q_flash, padded_local_heads = self._prepare_dcp_query(q)
+            if profile:
+                t1 = _dsv4_dcp_layer_profile_mark(profile_sync)
+                profile_timings_ms["q_gather"] = (t1 - t0) * 1000.0
         else:
             q_flash = q
             padded_local_heads = self.padded_heads
@@ -1086,6 +1201,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             },
         )
 
+        t0 = _dsv4_dcp_layer_profile_mark(profile_sync) if profile else 0.0
         out, lse = flash_mla_with_kvcache(
             q=q_flash,
             k_cache=swa_cache,
@@ -1103,6 +1219,9 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             extra_topk_length=topk_lens,
             out=flash_output.unsqueeze(1),
         )
+        if profile:
+            t1 = _dsv4_dcp_layer_profile_mark(profile_sync)
+            profile_timings_ms["flash"] = (t1 - t0) * 1000.0
         dsv4_debug_dump(
             "attn.decode.after_flash",
             layer_idx=self.debug_layer_idx,
@@ -1120,6 +1239,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             },
         )
         if self.dcp_world_size > 1:
+            t0 = _dsv4_dcp_layer_profile_mark(profile_sync) if profile else 0.0
             partial_out = self._normalize_flashmla_output(
                 out,
                 num_decode_tokens,
@@ -1130,12 +1250,29 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 num_decode_tokens,
                 q_flash.shape[2],
             )
+            if profile:
+                t1 = _dsv4_dcp_layer_profile_mark(profile_sync)
+                profile_timings_ms["normalize"] = (t1 - t0) * 1000.0
             self._dcp_lse_combine(
                 partial_out,
                 partial_lse,
                 output,
                 padded_local_heads,
+                profile_timings_ms if profile else None,
             )
+            if profile:
+                t1 = _dsv4_dcp_layer_profile_mark(profile_sync)
+                profile_timings_ms["total"] = (t1 - t_total) * 1000.0
+                _dsv4_dcp_layer_profile_record(
+                    dcp_rank=self.dcp_rank,
+                    layer_idx=self.debug_layer_idx,
+                    mode="decode",
+                    compress_ratio=self.compress_ratio,
+                    B=num_decode_tokens,
+                    H=q_flash.shape[2],
+                    D=self.head_dim,
+                    timings_ms=profile_timings_ms,
+                )
 
     def _forward_prefill(
         self,
@@ -1153,6 +1290,8 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         num_prefill_tokens = swa_metadata.num_prefill_tokens
         num_decodes = swa_metadata.num_decodes
         num_decode_tokens = swa_metadata.num_decode_tokens
+        profile = self.dcp_world_size > 1 and _dsv4_dcp_layer_profile_enabled()
+        profile_sync = profile and envs.VLLM_DSV4_DCP_LAYER_PROFILE_SYNC
 
         # Use pre-computed prefill metadata.
         seq_lens = swa_metadata.prefill_seq_lens
@@ -1290,9 +1429,15 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             )
 
             q_chunk = q[query_start:query_end]
+            profile_timings_ms: dict[str, float] = {}
+            t_total = _dsv4_dcp_layer_profile_mark(profile_sync) if profile else 0.0
             if self.dcp_world_size > 1:
                 assert flash_output_workspace is not None
+                t0 = _dsv4_dcp_layer_profile_mark(profile_sync) if profile else 0.0
                 q_chunk, padded_local_heads = self._prepare_dcp_query(q_chunk)
+                if profile:
+                    t1 = _dsv4_dcp_layer_profile_mark(profile_sync)
+                    profile_timings_ms["q_gather"] = (t1 - t0) * 1000.0
                 flash_output = flash_output_workspace[: q_chunk.shape[0]]
             else:
                 padded_local_heads = self.padded_heads
@@ -1354,6 +1499,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 },
             )
 
+            t0 = _dsv4_dcp_layer_profile_mark(profile_sync) if profile else 0.0
             output_chunk, lse, _ = flash_mla_sparse_fwd(
                 q=q_chunk,
                 kv=kv.view(-1, 1, q.shape[-1]),
@@ -1363,6 +1509,9 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 topk_length=combined_lens,
                 out=flash_output,
             )
+            if profile:
+                t1 = _dsv4_dcp_layer_profile_mark(profile_sync)
+                profile_timings_ms["flash"] = (t1 - t0) * 1000.0
             dsv4_debug_dump(
                 "attn.prefill.after_flash",
                 layer_idx=self.debug_layer_idx,
@@ -1383,6 +1532,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 },
             )
             if self.dcp_world_size > 1:
+                t0 = _dsv4_dcp_layer_profile_mark(profile_sync) if profile else 0.0
                 partial_out = self._normalize_flashmla_output(
                     output_chunk,
                     q_chunk.shape[0],
@@ -1393,12 +1543,29 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                     q_chunk.shape[0],
                     q_chunk.shape[1],
                 )
+                if profile:
+                    t1 = _dsv4_dcp_layer_profile_mark(profile_sync)
+                    profile_timings_ms["normalize"] = (t1 - t0) * 1000.0
                 self._dcp_lse_combine(
                     partial_out,
                     partial_lse,
                     output[query_start:query_end],
                     padded_local_heads,
+                    profile_timings_ms if profile else None,
                 )
+                if profile:
+                    t1 = _dsv4_dcp_layer_profile_mark(profile_sync)
+                    profile_timings_ms["total"] = (t1 - t_total) * 1000.0
+                    _dsv4_dcp_layer_profile_record(
+                        dcp_rank=self.dcp_rank,
+                        layer_idx=self.debug_layer_idx,
+                        mode="prefill",
+                        compress_ratio=self.compress_ratio,
+                        B=q_chunk.shape[0],
+                        H=q_chunk.shape[1],
+                        D=self.head_dim,
+                        timings_ms=profile_timings_ms,
+                    )
 
 
 class DeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):
