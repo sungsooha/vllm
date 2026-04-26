@@ -262,6 +262,12 @@ if TYPE_CHECKING:
     VLLM_ELASTIC_EP_SCALE_UP_LAUNCH: bool = False
     VLLM_ELASTIC_EP_DRAIN_REQUESTS: bool = False
     VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS: bool = True
+    VLLM_DSV4_DCP_LAYER_PROFILE: bool = False
+    VLLM_DSV4_DCP_LAYER_PROFILE_INTERVAL: int = 100
+    VLLM_DSV4_DCP_LAYER_PROFILE_WARMUP: int = 10
+    VLLM_DSV4_DCP_LAYER_PROFILE_SYNC: bool = True
+    VLLM_DSV4_DCP_LAYER_PROFILE_ALL_RANKS: bool = False
+    VLLM_DSV4_DCP_Q_REPLICATE: bool = False
     VLLM_NIXL_EP_MAX_NUM_RANKS: int = 32
     VLLM_XPU_ENABLE_XPU_GRAPH: bool = False
     VLLM_LORA_ENABLE_DUAL_STREAM: bool = False
@@ -1621,6 +1627,55 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Add optional nvtx scopes for profiling, disable to avoid overheads
     "VLLM_NVTX_SCOPES_FOR_PROFILING": lambda: bool(
         int(os.getenv("VLLM_NVTX_SCOPES_FOR_PROFILING", "0"))
+    ),
+    # Profile DCP A2A attention communication. This is intended for targeted
+    # debug/profiling runs only; enabling synchronization changes timing.
+    "VLLM_DCP_A2A_PROFILE": lambda: bool(int(os.getenv("VLLM_DCP_A2A_PROFILE", "0"))),
+    # Use the experimental packed DCP A2A path, which packs attention output
+    # and fp32 LSE into one buffer and uses one all_to_all_single collective.
+    "VLLM_DCP_A2A_PACKED": lambda: bool(int(os.getenv("VLLM_DCP_A2A_PACKED", "0"))),
+    # Log DCP A2A profile summaries every N calls per worker.
+    "VLLM_DCP_A2A_PROFILE_INTERVAL": lambda: int(
+        os.getenv("VLLM_DCP_A2A_PROFILE_INTERVAL", "100")
+    ),
+    # Skip the first N calls before accumulating DCP A2A profile summaries.
+    "VLLM_DCP_A2A_PROFILE_WARMUP": lambda: int(
+        os.getenv("VLLM_DCP_A2A_PROFILE_WARMUP", "10")
+    ),
+    # Synchronize around DCP A2A profiling regions for more stable timings.
+    "VLLM_DCP_A2A_PROFILE_SYNC": lambda: bool(
+        int(os.getenv("VLLM_DCP_A2A_PROFILE_SYNC", "1"))
+    ),
+    # Log DCP A2A summaries from every DCP rank instead of rank 0 only.
+    "VLLM_DCP_A2A_PROFILE_ALL_RANKS": lambda: bool(
+        int(os.getenv("VLLM_DCP_A2A_PROFILE_ALL_RANKS", "0"))
+    ),
+    # Profile DeepSeek V4 DCP attention at the layer level. This is intended for
+    # targeted debug/profiling runs only; enabling synchronization changes timing.
+    "VLLM_DSV4_DCP_LAYER_PROFILE": lambda: bool(
+        int(os.getenv("VLLM_DSV4_DCP_LAYER_PROFILE", "0"))
+    ),
+    # Log DeepSeek V4 DCP layer profile summaries every N calls per worker.
+    "VLLM_DSV4_DCP_LAYER_PROFILE_INTERVAL": lambda: int(
+        os.getenv("VLLM_DSV4_DCP_LAYER_PROFILE_INTERVAL", "100")
+    ),
+    # Skip the first N calls before accumulating DSV4 DCP layer profile summaries.
+    "VLLM_DSV4_DCP_LAYER_PROFILE_WARMUP": lambda: int(
+        os.getenv("VLLM_DSV4_DCP_LAYER_PROFILE_WARMUP", "10")
+    ),
+    # Synchronize around DSV4 DCP layer profiling regions for stable timings.
+    "VLLM_DSV4_DCP_LAYER_PROFILE_SYNC": lambda: bool(
+        int(os.getenv("VLLM_DSV4_DCP_LAYER_PROFILE_SYNC", "1"))
+    ),
+    # Log DSV4 DCP layer summaries from every DCP rank instead of rank 0 only.
+    "VLLM_DSV4_DCP_LAYER_PROFILE_ALL_RANKS": lambda: bool(
+        int(os.getenv("VLLM_DSV4_DCP_LAYER_PROFILE_ALL_RANKS", "0"))
+    ),
+    # Experimental DeepSeek V4 DCP Q-projection replication. When enabled,
+    # each rank owns the Q projection rows for its DCP group and computes the
+    # FlashMLA query locally instead of all-gathering local Q heads every layer.
+    "VLLM_DSV4_DCP_Q_REPLICATE": lambda: bool(
+        int(os.getenv("VLLM_DSV4_DCP_Q_REPLICATE", "0"))
     ),
     # Represent block hashes in KV cache events as 64-bit integers instead of
     # raw bytes. Defaults to True for backward compatibility.
