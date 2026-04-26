@@ -572,6 +572,8 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         )
         q_dcp_replicated = None
         q_dcp_replicated_profile_ms = 0.0
+        profile_q_rep = False
+        profile_sync = False
         if self.wq_b_dcp is not None:
             profile_q_rep = (
                 self.mla_attn.dcp_world_size > 1 and _dsv4_dcp_layer_profile_enabled()
@@ -682,6 +684,18 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             out.zero_()
             return
 
+        if q_dcp_replicated is not None:
+            t0 = _dsv4_dcp_layer_profile_mark(profile_sync) if profile_q_rep else 0.0
+            self._fused_qnorm_rope_q_only(
+                q_dcp_replicated,
+                kv,
+                positions,
+                attn_metadata,
+            )
+            if profile_q_rep:
+                t1 = _dsv4_dcp_layer_profile_mark(profile_sync)
+                q_dcp_replicated_profile_ms += (t1 - t0) * 1000.0
+
         # Pad q to FlashMLA-required head count (64 or 128)
         if self.n_local_heads < self.padded_heads:
             pad_size = self.padded_heads - self.n_local_heads
@@ -728,6 +742,35 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             kv,
             swa_kv_cache_2d,
             swa_metadata.slot_mapping,
+            positions.to(torch.int64),
+            self.rotary_emb.cos_sin_cache,
+            self.eps,
+            swa_metadata.block_size,
+        )
+
+    def _fused_qnorm_rope_q_only(
+        self,
+        q: torch.Tensor,
+        kv: torch.Tensor,
+        positions: torch.Tensor,
+        attn_metadata: dict,
+    ) -> None:
+        swa_metadata = attn_metadata.get(self.swa_cache_layer.prefix)
+        assert swa_metadata is not None
+
+        # Reuse the DSV4 fused QNorm+RoPE+KV-insert op with an empty
+        # slot_mapping. The kernel transforms all Q rows and skips the KV branch
+        # when num_tokens_insert == 0, preserving the exact Q transform used by
+        # the normal local-Q path without inserting KV twice.
+        swa_kv_cache_2d = self.swa_cache_layer.kv_cache.view(
+            self.swa_cache_layer.kv_cache.shape[0],
+            -1,
+        )
+        torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+            q,
+            kv,
+            swa_kv_cache_2d,
+            swa_metadata.slot_mapping[:0],
             positions.to(torch.int64),
             self.rotary_emb.cos_sin_cache,
             self.eps,
