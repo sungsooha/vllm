@@ -9,6 +9,10 @@ import torch
 from vllm.model_executor.layers.deepseek_v4_attention import (
     _apply_attn_sink_with_lse,
     _get_dcp_padded_head_counts,
+    _pad_dcp_replicated_query,
+)
+from vllm.model_executor.models.deepseek_v4 import (
+    _load_dsv4_dcp_replicated_column_weight,
 )
 from vllm.v1.kv_cache_interface import (
     SlidingWindowMLASpec,
@@ -108,6 +112,34 @@ def test_deepseek_v4_dcp_flashmla_head_padding(
 def test_deepseek_v4_dcp_flashmla_head_padding_rejects_unsupported():
     with pytest.raises(ValueError, match="supported head count"):
         _get_dcp_padded_head_counts(local_heads=65, dcp_world_size=2)
+
+
+def test_deepseek_v4_dcp_replicated_query_padding_matches_gather_order():
+    q = torch.arange(2 * 3 * 2 * 1, dtype=torch.float32).view(2, 6, 1)
+
+    actual = _pad_dcp_replicated_query(q, local_heads=3, dcp_world_size=2)
+
+    expected = torch.zeros(2, 64, 1)
+    expected[:, :3] = q[:, :3]
+    expected[:, 32:35] = q[:, 3:6]
+    torch.testing.assert_close(actual, expected)
+
+
+def test_deepseek_v4_dcp_replicated_query_padding_noop_when_aligned():
+    q = torch.randn(2, 64, 4)
+
+    actual = _pad_dcp_replicated_query(q, local_heads=16, dcp_world_size=4)
+
+    assert actual is q
+
+
+def test_deepseek_v4_dcp_replicated_wq_loader_slices_group_rows():
+    param = SimpleNamespace(data=torch.empty(4, 3), output_dim=0)
+    loaded = torch.arange(12 * 3, dtype=torch.float32).view(12, 3)
+
+    _load_dsv4_dcp_replicated_column_weight(param, loaded, group_idx=2)
+
+    torch.testing.assert_close(param.data, loaded[8:12])
 
 
 def test_deepseek_v4_dcp_attn_sink_uses_global_lse_once():

@@ -159,7 +159,7 @@ def _dsv4_dcp_layer_profile_record(
     logger.info(
         "DSV4_DCP_LAYER_PROFILE rank=%d layer=%d mode=%s "
         "compress_ratio=%d shape=B%d_H%d_D%d calls=%d warmup=%d sync=%s "
-        "avg_ms(q_gather=%.3f,flash=%.3f,normalize=%.3f,"
+        "avg_ms(q_gather=%.3f,q_rep_proj=%.3f,flash=%.3f,normalize=%.3f,"
         "a2a_reduce=%.3f,sink_scale=%.3f,output_copy=%.3f,"
         "sink_copy=%.3f,total=%.3f)",
         dcp_rank,
@@ -173,6 +173,7 @@ def _dsv4_dcp_layer_profile_record(
         stats.skipped_warmup,
         envs.VLLM_DSV4_DCP_LAYER_PROFILE_SYNC,
         stats.avg("q_gather"),
+        stats.avg("q_rep_proj"),
         stats.avg("flash"),
         stats.avg("normalize"),
         stats.avg("a2a_reduce"),
@@ -201,6 +202,35 @@ def _get_dcp_padded_head_counts(
         f"supported head count {DeepseekV4MLAAttention.SUPPORTED_HEAD_COUNTS}, "
         f"got local_heads={local_heads}, dcp_world_size={dcp_world_size}."
     )
+
+
+def _pad_dcp_replicated_query(
+    q_dcp: torch.Tensor,
+    local_heads: int,
+    dcp_world_size: int,
+) -> torch.Tensor:
+    """Pad each DCP rank's replicated Q head chunk to FlashMLA shape."""
+    padded_local_heads, padded_global_heads = _get_dcp_padded_head_counts(
+        local_heads,
+        dcp_world_size,
+    )
+    expected_heads = local_heads * dcp_world_size
+    assert q_dcp.shape[1] == expected_heads, (
+        f"replicated DCP Q has {q_dcp.shape[1]} heads, expected "
+        f"{expected_heads} ({local_heads} local heads * {dcp_world_size} DCP ranks)"
+    )
+    if padded_local_heads == local_heads:
+        return q_dcp
+
+    q_by_rank = q_dcp.view(q_dcp.shape[0], dcp_world_size, local_heads, q_dcp.shape[2])
+    padded = q_dcp.new_zeros(
+        q_dcp.shape[0],
+        dcp_world_size,
+        padded_local_heads,
+        q_dcp.shape[2],
+    )
+    padded[:, :, :local_heads, :].copy_(q_by_rank)
+    return padded.view(q_dcp.shape[0], padded_global_heads, q_dcp.shape[2])
 
 
 def _apply_attn_sink_with_lse(
@@ -304,6 +334,7 @@ class DeepseekV4MLAModules:
     fused_wqa_wkv: torch.nn.Module
     q_norm: torch.nn.Module
     wq_b: torch.nn.Module
+    wq_b_dcp: torch.nn.Module | None
     kv_norm: torch.nn.Module
     wo_a: torch.nn.Module
     wo_b: torch.nn.Module
@@ -394,6 +425,7 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         self.fused_wqa_wkv = mla_modules.fused_wqa_wkv
         self.q_norm = mla_modules.q_norm
         self.wq_b = mla_modules.wq_b
+        self.wq_b_dcp = mla_modules.wq_b_dcp
 
         self.kv_norm = mla_modules.kv_norm
         self.wo_a = mla_modules.wo_a
@@ -580,6 +612,27 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             self.eps,
         )
         q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
+        q_dcp_replicated = None
+        q_dcp_replicated_profile_ms = 0.0
+        if self.wq_b_dcp is not None:
+            profile_q_rep = (
+                self.mla_attn.dcp_world_size > 1 and _dsv4_dcp_layer_profile_enabled()
+            )
+            profile_sync = profile_q_rep and envs.VLLM_DSV4_DCP_LAYER_PROFILE_SYNC
+            t0 = _dsv4_dcp_layer_profile_mark(profile_sync) if profile_q_rep else 0.0
+            q_dcp = self.wq_b_dcp(qr).view(
+                -1,
+                self.n_local_heads * self.mla_attn.dcp_world_size,
+                self.head_dim,
+            )
+            q_dcp_replicated = _pad_dcp_replicated_query(
+                q_dcp,
+                self.n_local_heads,
+                self.mla_attn.dcp_world_size,
+            )
+            if profile_q_rep:
+                t1 = _dsv4_dcp_layer_profile_mark(profile_sync)
+                q_dcp_replicated_profile_ms = (t1 - t0) * 1000.0
 
         # Overlap kv_insert with whichever of indexer/compressor is present.
         # Indexer implies compressor; when both exist, compressor rides on the
@@ -659,7 +712,14 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
 
         # MLA attention writes into the pre-allocated `out` buffer
         # ([num_tokens, padded_heads, head_dim]).
-        self.mla_attn(q, kv, positions, output=out)
+        self.mla_attn(
+            q,
+            kv,
+            positions,
+            output=out,
+            q_dcp_replicated=q_dcp_replicated,
+            q_dcp_replicated_profile_ms=q_dcp_replicated_profile_ms,
+        )
 
     def _fused_qnorm_rope_kv_insert(
         self,
@@ -918,6 +978,8 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         kv: torch.Tensor,
         positions: torch.Tensor,
         output: torch.Tensor,
+        q_dcp_replicated: torch.Tensor | None = None,
+        q_dcp_replicated_profile_ms: float = 0.0,
     ) -> None:
         assert output.shape == q.shape, (
             f"output buffer shape {output.shape} must match q shape {q.shape}"
@@ -925,6 +987,24 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         assert output.dtype == q.dtype, (
             f"output buffer dtype {output.dtype} must match q dtype {q.dtype}"
         )
+        if q_dcp_replicated is not None:
+            _, padded_global_heads = _get_dcp_padded_head_counts(
+                self.num_heads,
+                self.dcp_world_size,
+            )
+            assert q_dcp_replicated.shape == (
+                q.shape[0],
+                padded_global_heads,
+                self.head_dim,
+            ), (
+                "replicated DCP Q shape "
+                f"{tuple(q_dcp_replicated.shape)} does not match expected "
+                f"{(q.shape[0], padded_global_heads, self.head_dim)}"
+            )
+            assert q_dcp_replicated.dtype == q.dtype, (
+                "replicated DCP Q dtype "
+                f"{q_dcp_replicated.dtype} must match local Q dtype {q.dtype}"
+            )
 
         # Get SWA and indexer metadata from forward context
         forward_context = get_forward_context()
@@ -943,6 +1023,13 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         num_decodes = swa_metadata.num_decodes
         num_prefills = swa_metadata.num_prefills
         num_decode_tokens = swa_metadata.num_decode_tokens
+        total_tokens = max(q.shape[0], 1)
+        decode_q_rep_profile_ms = (
+            q_dcp_replicated_profile_ms * num_decode_tokens / total_tokens
+        )
+        prefill_q_rep_profile_ms = q_dcp_replicated_profile_ms - (
+            decode_q_rep_profile_ms
+        )
 
         if num_prefills > 0:
             self._forward_prefill(
@@ -953,6 +1040,12 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 output=output[num_decode_tokens:],
                 attn_metadata=flashmla_metadata,
                 swa_metadata=swa_metadata,
+                q_dcp_replicated=(
+                    q_dcp_replicated[num_decode_tokens:]
+                    if q_dcp_replicated is not None
+                    else None
+                ),
+                q_dcp_replicated_profile_ms=prefill_q_rep_profile_ms,
             )
         if num_decodes > 0:
             self._forward_decode(
@@ -962,6 +1055,12 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 attn_metadata=flashmla_metadata,
                 swa_only=swa_only,
                 output=output[:num_decode_tokens],
+                q_dcp_replicated=(
+                    q_dcp_replicated[:num_decode_tokens]
+                    if q_dcp_replicated is not None
+                    else None
+                ),
+                q_dcp_replicated_profile_ms=decode_q_rep_profile_ms,
             )
 
     def _prepare_dcp_query(
@@ -1095,6 +1194,8 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         attn_metadata: FlashMLASparseMetadata | None,
         swa_only: bool,
         output: torch.Tensor,
+        q_dcp_replicated: torch.Tensor | None = None,
+        q_dcp_replicated_profile_ms: float = 0.0,
     ) -> None:
         num_decodes = swa_metadata.num_decodes
         num_decode_tokens = swa_metadata.num_decode_tokens
@@ -1133,11 +1234,20 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         # query heads across the DCP group before FlashMLA; the cross-rank LSE
         # combine scatters the result back to this rank's local heads.
         if self.dcp_world_size > 1:
-            t0 = _dsv4_dcp_layer_profile_mark(profile_sync) if profile else 0.0
-            q_flash, padded_local_heads = self._prepare_dcp_query(q)
-            if profile:
-                t1 = _dsv4_dcp_layer_profile_mark(profile_sync)
-                profile_timings_ms["q_gather"] = (t1 - t0) * 1000.0
+            padded_local_heads, _ = _get_dcp_padded_head_counts(
+                self.num_heads,
+                self.dcp_world_size,
+            )
+            if q_dcp_replicated is not None:
+                q_flash = q_dcp_replicated
+                if profile:
+                    profile_timings_ms["q_rep_proj"] = q_dcp_replicated_profile_ms
+            else:
+                t0 = _dsv4_dcp_layer_profile_mark(profile_sync) if profile else 0.0
+                q_flash, padded_local_heads = self._prepare_dcp_query(q)
+                if profile:
+                    t1 = _dsv4_dcp_layer_profile_mark(profile_sync)
+                    profile_timings_ms["q_gather"] = (t1 - t0) * 1000.0
         else:
             q_flash = q
             padded_local_heads = self.padded_heads
@@ -1283,6 +1393,8 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         output: torch.Tensor,
         attn_metadata: FlashMLASparseMetadata | None,
         swa_metadata: "DeepseekSparseSWAMetadata",
+        q_dcp_replicated: torch.Tensor | None = None,
+        q_dcp_replicated_profile_ms: float = 0.0,
     ) -> None:
         swa_only = attn_metadata is None
 
@@ -1433,11 +1545,25 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             t_total = _dsv4_dcp_layer_profile_mark(profile_sync) if profile else 0.0
             if self.dcp_world_size > 1:
                 assert flash_output_workspace is not None
-                t0 = _dsv4_dcp_layer_profile_mark(profile_sync) if profile else 0.0
-                q_chunk, padded_local_heads = self._prepare_dcp_query(q_chunk)
-                if profile:
-                    t1 = _dsv4_dcp_layer_profile_mark(profile_sync)
-                    profile_timings_ms["q_gather"] = (t1 - t0) * 1000.0
+                padded_local_heads, _ = _get_dcp_padded_head_counts(
+                    self.num_heads,
+                    self.dcp_world_size,
+                )
+                if q_dcp_replicated is not None:
+                    q_chunk = q_dcp_replicated[query_start:query_end]
+                    if profile:
+                        chunk_tokens = max(q_dcp_replicated.shape[0], 1)
+                        profile_timings_ms["q_rep_proj"] = (
+                            q_dcp_replicated_profile_ms
+                            * q_chunk.shape[0]
+                            / chunk_tokens
+                        )
+                else:
+                    t0 = _dsv4_dcp_layer_profile_mark(profile_sync) if profile else 0.0
+                    q_chunk, padded_local_heads = self._prepare_dcp_query(q_chunk)
+                    if profile:
+                        t1 = _dsv4_dcp_layer_profile_mark(profile_sync)
+                        profile_timings_ms["q_gather"] = (t1 - t0) * 1000.0
                 flash_output = flash_output_workspace[: q_chunk.shape[0]]
             else:
                 padded_local_heads = self.padded_heads

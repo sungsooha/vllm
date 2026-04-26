@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from vllm import envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import (
@@ -27,6 +28,7 @@ from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
+    ReplicatedLinear,
     RowParallelLinear,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -99,6 +101,33 @@ class DeepseekV4FP8Config(Fp8Config):
 
     def is_mxfp4_quant(self, prefix, layer):
         return isinstance(layer, FusedMoE)
+
+
+def _dsv4_dcp_q_group_index(tp_rank: int, dcp_world_size: int) -> int:
+    return tp_rank // dcp_world_size
+
+
+def _load_dsv4_dcp_replicated_column_weight(
+    param: torch.nn.Parameter,
+    loaded_weight: torch.Tensor,
+    group_idx: int,
+) -> None:
+    """Load the contiguous TP rows owned by one DCP group into a replica."""
+    output_dim = getattr(param, "output_dim", None)
+    if len(loaded_weight.shape) == 0:
+        loaded_weight = loaded_weight.reshape(1)
+
+    param_data = param.data
+    if output_dim is not None and loaded_weight.shape != param_data.shape:
+        shard_size = param_data.shape[output_dim]
+        start_idx = group_idx * shard_size
+        loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
+
+    assert param_data.shape == loaded_weight.shape, (
+        f"Tried to load DCP-replicated wq_b weight of size {loaded_weight.shape} "
+        f"into parameter of size {param_data.shape}"
+    )
+    param_data.copy_(loaded_weight)
 
 
 class DeepseekV4MoE(nn.Module):
@@ -294,6 +323,18 @@ class DeepseekV4Attention(nn.Module):
             return_bias=False,
             prefix=f"{prefix}.wq_b",
         )
+        self.dcp_world_size = vllm_config.parallel_config.decode_context_parallel_size
+        self.wq_b_dcp = None
+        if envs.VLLM_DSV4_DCP_Q_REPLICATE and self.dcp_world_size > 1:
+            dcp_heads = self.n_local_heads * self.dcp_world_size
+            self.wq_b_dcp = ReplicatedLinear(
+                self.q_lora_rank,
+                dcp_heads * self.head_dim,
+                bias=False,
+                quant_config=quant_config,
+                return_bias=False,
+                prefix=f"{prefix}.wq_b_dcp",
+            )
 
         self.kv_norm = RMSNorm(self.head_dim, self.eps)
         self.wo_a = ColumnParallelLinear(
@@ -364,6 +405,7 @@ class DeepseekV4Attention(nn.Module):
             fused_wqa_wkv=self.fused_wqa_wkv,
             q_norm=self.q_norm,
             wq_b=self.wq_b,
+            wq_b_dcp=self.wq_b_dcp,
             kv_norm=self.kv_norm,
             wo_a=self.wo_a,
             wo_b=self.wo_b,
@@ -582,6 +624,7 @@ class DeepseekV4Model(nn.Module):
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
         self.config = config
+        self.dcp_world_size = vllm_config.parallel_config.decode_context_parallel_size
 
         self.vocab_size = config.vocab_size
         self.hc_eps = config.hc_eps
@@ -725,6 +768,8 @@ class DeepseekV4Model(nn.Module):
         n_local_head = n_head // tp_size
         head_rank_start = n_local_head * tp_rank
         head_rank_end = n_local_head * (tp_rank + 1)
+        dcp_world_size = self.dcp_world_size
+        dcp_q_group_idx = _dsv4_dcp_q_group_index(tp_rank, dcp_world_size)
 
         # Pre-compute expert mapping ONCE.
         expert_mapping = self.get_expert_mapping()
@@ -792,6 +837,19 @@ class DeepseekV4Model(nn.Module):
                     )
                     weight_loader(param, loaded_weight)
                     loaded_params.add(name)
+                    if (
+                        envs.VLLM_DSV4_DCP_Q_REPLICATE
+                        and dcp_world_size > 1
+                        and ".attn.wq_b." in name
+                    ):
+                        dcp_name = name.replace(".attn.wq_b.", ".attn.wq_b_dcp.")
+                        if dcp_name in params_dict:
+                            _load_dsv4_dcp_replicated_column_weight(
+                                params_dict[dcp_name],
+                                loaded_weight,
+                                dcp_q_group_idx,
+                            )
+                            loaded_params.add(dcp_name)
                     continue
 
         return loaded_params
