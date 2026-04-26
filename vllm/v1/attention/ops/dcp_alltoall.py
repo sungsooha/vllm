@@ -22,16 +22,117 @@ Reference: https://arxiv.org/abs/2507.07120
 
 from __future__ import annotations
 
+import time
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
 
+from vllm import envs
+from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 
 if TYPE_CHECKING:
     from vllm.distributed.parallel_state import GroupCoordinator
     from vllm.v1.attention.ops.common import CPTritonContext
+
+logger = init_logger(__name__)
+
+
+@dataclass
+class _DCPA2AProfileStats:
+    calls: int = 0
+    skipped_warmup: int = 0
+    bytes_output: int = 0
+    bytes_lse: int = 0
+    totals_ms: dict[str, float] = field(default_factory=dict)
+
+    def add(
+        self,
+        timings_ms: dict[str, float],
+        bytes_output: int,
+        bytes_lse: int,
+    ) -> None:
+        self.calls += 1
+        self.bytes_output += bytes_output
+        self.bytes_lse += bytes_lse
+        for key, value in timings_ms.items():
+            self.totals_ms[key] = self.totals_ms.get(key, 0.0) + value
+
+    def avg(self, key: str) -> float:
+        if self.calls == 0:
+            return 0.0
+        return self.totals_ms.get(key, 0.0) / self.calls
+
+
+_DCP_A2A_PROFILE_STATS: dict[
+    tuple[int, int, int, int, bool, bool], _DCPA2AProfileStats
+] = {}
+
+
+def _dcp_a2a_profile_enabled() -> bool:
+    return bool(envs.VLLM_DCP_A2A_PROFILE)
+
+
+def _dcp_a2a_should_log_rank(cp_group: GroupCoordinator) -> bool:
+    if envs.VLLM_DCP_A2A_PROFILE_ALL_RANKS:
+        return True
+    return getattr(cp_group, "rank_in_group", 0) == 0
+
+
+def _dcp_a2a_mark(sync: bool) -> float:
+    if sync:
+        torch.accelerator.synchronize()
+    return time.perf_counter()
+
+
+def _dcp_a2a_profile_record(
+    cp_group: GroupCoordinator,
+    key: tuple[int, int, int, int, bool, bool],
+    timings_ms: dict[str, float],
+    bytes_output: int,
+    bytes_lse: int,
+) -> None:
+    stats = _DCP_A2A_PROFILE_STATS.setdefault(key, _DCPA2AProfileStats())
+    warmup = max(envs.VLLM_DCP_A2A_PROFILE_WARMUP, 0)
+    if stats.skipped_warmup < warmup:
+        stats.skipped_warmup += 1
+        return
+
+    stats.add(timings_ms, bytes_output, bytes_lse)
+    interval = max(envs.VLLM_DCP_A2A_PROFILE_INTERVAL, 1)
+    if stats.calls % interval != 0 or not _dcp_a2a_should_log_rank(cp_group):
+        return
+
+    world_size, B, H, D, return_lse, is_lse_base_on_e = key
+    rank = getattr(cp_group, "rank_in_group", -1)
+    total_mb = (stats.bytes_output + stats.bytes_lse) / (1024 * 1024)
+    logger.info(
+        "DCP_A2A_PROFILE rank=%s world=%d shape=B%d_H%d_D%d "
+        "calls=%d warmup=%d sync=%s return_lse=%s lse_base_e=%s "
+        "avg_ms(total=%.3f,copy=%.3f,pack=%.3f,a2a_enqueue=%.3f,"
+        "wait_output=%.3f,wait_lse=%.3f,combine=%.3f) "
+        "avg_comm_mb=%.3f",
+        rank,
+        world_size,
+        B,
+        H,
+        D,
+        stats.calls,
+        stats.skipped_warmup,
+        envs.VLLM_DCP_A2A_PROFILE_SYNC,
+        return_lse,
+        is_lse_base_on_e,
+        stats.avg("total"),
+        stats.avg("copy"),
+        stats.avg("pack"),
+        stats.avg("a2a_enqueue"),
+        stats.avg("wait_output"),
+        stats.avg("wait_lse"),
+        stats.avg("combine"),
+        total_mb / stats.calls,
+    )
 
 
 def _lse_weighted_combine(
@@ -321,12 +422,23 @@ def dcp_a2a_lse_reduce(
             return cp_attn_out, cp_attn_lse
         return cp_attn_out
 
+    profile = _dcp_a2a_profile_enabled()
+    profile_sync = profile and envs.VLLM_DCP_A2A_PROFILE_SYNC
+
+    timings_ms: dict[str, float] = {}
+    t_total = _dcp_a2a_mark(profile_sync) if profile else 0.0
+
+    t0 = _dcp_a2a_mark(profile_sync) if profile else 0.0
     local_output = cp_attn_out.contiguous()
     local_lse = cp_attn_lse.contiguous()
+    if profile:
+        t1 = _dcp_a2a_mark(profile_sync)
+        timings_ms["copy"] = (t1 - t0) * 1000.0
 
     B, H, D = local_output.shape
     H_per_rank = H // world_size
 
+    t0 = _dcp_a2a_mark(profile_sync) if profile else 0.0
     # Reshape for All-to-All: [B, H, D] -> [N, B, H/N, D]
     # Split heads into N chunks, each destined for a different rank
     send_output = (
@@ -337,8 +449,12 @@ def dcp_a2a_lse_reduce(
     # Same for LSE: [B, H] -> [N, B, H/N]
     send_lse = local_lse.view(B, world_size, H_per_rank).permute(1, 0, 2).contiguous()
     recv_lse = torch.empty_like(send_lse)
+    if profile:
+        t1 = _dcp_a2a_mark(profile_sync)
+        timings_ms["pack"] = (t1 - t0) * 1000.0
 
     # All-to-All for partial attention outputs and LSE values (async overlap)
+    t0 = time.perf_counter() if profile else 0.0
     work_output = dist.all_to_all_single(
         recv_output.view(-1),
         send_output.view(-1),
@@ -351,13 +467,42 @@ def dcp_a2a_lse_reduce(
         group=cp_group.device_group,
         async_op=True,
     )
+    if profile:
+        t1 = time.perf_counter()
+        timings_ms["a2a_enqueue"] = (t1 - t0) * 1000.0
+
+    t0 = time.perf_counter() if profile else 0.0
     work_output.wait()
+    if profile:
+        t1 = _dcp_a2a_mark(profile_sync)
+        timings_ms["wait_output"] = (t1 - t0) * 1000.0
+
+    t0 = time.perf_counter() if profile else 0.0
     work_lse.wait()
+    if profile:
+        t1 = _dcp_a2a_mark(profile_sync)
+        timings_ms["wait_lse"] = (t1 - t0) * 1000.0
 
     # LSE-weighted combination via Triton kernel (local, no communication)
-    return dcp_lse_combine_triton(
+    t0 = _dcp_a2a_mark(profile_sync) if profile else 0.0
+    result = dcp_lse_combine_triton(
         recv_output,
         recv_lse,
         return_lse=return_lse,
         is_lse_base_on_e=is_lse_base_on_e,
     )
+    if profile:
+        t1 = _dcp_a2a_mark(profile_sync)
+        timings_ms["combine"] = (t1 - t0) * 1000.0
+        timings_ms["total"] = (t1 - t_total) * 1000.0
+        bytes_output = send_output.numel() * send_output.element_size()
+        bytes_lse = send_lse.numel() * send_lse.element_size()
+        profile_key = (world_size, B, H, D, return_lse, is_lse_base_on_e)
+        _dcp_a2a_profile_record(
+            cp_group,
+            profile_key,
+            timings_ms,
+            bytes_output,
+            bytes_lse,
+        )
+    return result

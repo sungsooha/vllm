@@ -1599,6 +1599,25 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_NVTX_SCOPES_FOR_PROFILING": lambda: bool(
         int(os.getenv("VLLM_NVTX_SCOPES_FOR_PROFILING", "0"))
     ),
+    # Profile DCP A2A attention communication. This is intended for targeted
+    # debug/profiling runs only; enabling synchronization changes timing.
+    "VLLM_DCP_A2A_PROFILE": lambda: bool(int(os.getenv("VLLM_DCP_A2A_PROFILE", "0"))),
+    # Log DCP A2A profile summaries every N calls per worker.
+    "VLLM_DCP_A2A_PROFILE_INTERVAL": lambda: int(
+        os.getenv("VLLM_DCP_A2A_PROFILE_INTERVAL", "100")
+    ),
+    # Skip the first N calls before accumulating DCP A2A profile summaries.
+    "VLLM_DCP_A2A_PROFILE_WARMUP": lambda: int(
+        os.getenv("VLLM_DCP_A2A_PROFILE_WARMUP", "10")
+    ),
+    # Synchronize around DCP A2A profiling regions for more stable timings.
+    "VLLM_DCP_A2A_PROFILE_SYNC": lambda: bool(
+        int(os.getenv("VLLM_DCP_A2A_PROFILE_SYNC", "1"))
+    ),
+    # Log DCP A2A summaries from every DCP rank instead of rank 0 only.
+    "VLLM_DCP_A2A_PROFILE_ALL_RANKS": lambda: bool(
+        int(os.getenv("VLLM_DCP_A2A_PROFILE_ALL_RANKS", "0"))
+    ),
     # Represent block hashes in KV cache events as 64-bit integers instead of
     # raw bytes. Defaults to True for backward compatibility.
     "VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES": lambda: bool(
