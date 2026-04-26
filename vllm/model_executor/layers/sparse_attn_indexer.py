@@ -35,6 +35,7 @@ elif current_platform.is_xpu():
 logger = init_logger(__name__)
 
 RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
+PERSISTENT_TOPK_LONG_CONTEXT_FALLBACK_MIN_SEQ_LEN = 131072
 
 # MXFP4 layout: 2 values packed per byte, ue8m0 (1-byte) scale per block of 32.
 MXFP4_BLOCK_SIZE = 32
@@ -317,8 +318,17 @@ def sparse_attn_indexer(
         )
         num_rows = logits.shape[0]
         topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
+        max_seq_len = attn_metadata.max_seq_len
+        long_context_topk512_fallback = (
+            topk_tokens == 512
+            and max_seq_len >= PERSISTENT_TOPK_LONG_CONTEXT_FALLBACK_MIN_SEQ_LEN
+        )
 
-        if current_platform.is_cuda() and topk_tokens in (512, 2048):
+        if (
+            current_platform.is_cuda()
+            and topk_tokens in (512, 2048)
+            and not long_context_topk512_fallback
+        ):
             workspace_manager = current_workspace_manager()
             (topk_workspace,) = workspace_manager.get_simultaneous(
                 ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
@@ -329,7 +339,7 @@ def sparse_attn_indexer(
                 topk_indices,
                 topk_workspace,
                 topk_tokens,
-                attn_metadata.max_seq_len,
+                max_seq_len,
             )
         else:
             if current_platform.is_xpu():
