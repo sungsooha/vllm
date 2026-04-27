@@ -815,6 +815,56 @@ def dcp_a2a_lse_reduce(
             return cp_attn_out, cp_attn_lse
         return cp_attn_out
 
+    # Large prefill chunks can make A2A temporary buffers several GiB each:
+    # [world_size, tokens, heads_per_rank, head_dim]. Bound the transient
+    # allocation while keeping the low-token decode path on the fast path.
+    max_tokens = envs.VLLM_DCP_A2A_MAX_TOKENS
+    if max_tokens > 0 and cp_attn_out.shape[0] > max_tokens:
+        B, H, D = cp_attn_out.shape
+        if H % world_size != 0:
+            raise ValueError(f"H={H} must be divisible by DCP world size {world_size}.")
+        H_per_rank = H // world_size
+        logger.info_once(
+            "Chunking DCP A2A LSE reduce for large token batch: "
+            "tokens=%d, max_tokens=%d, world_size=%d, heads=%d, head_dim=%d",
+            B,
+            max_tokens,
+            world_size,
+            H,
+            D,
+        )
+        out = torch.empty(
+            (B, H_per_rank, D), device=cp_attn_out.device, dtype=cp_attn_out.dtype
+        )
+        out_lse = (
+            torch.empty((B, H_per_rank), device=cp_attn_out.device, dtype=torch.float32)
+            if return_lse
+            else None
+        )
+        for start in range(0, B, max_tokens):
+            end = min(start + max_tokens, B)
+            chunk_result = dcp_a2a_lse_reduce(
+                cp_attn_out[start:end],
+                cp_attn_lse[start:end],
+                cp_group,
+                ctx=ctx,
+                return_lse=return_lse,
+                is_lse_base_on_e=is_lse_base_on_e,
+            )
+            if return_lse:
+                assert isinstance(chunk_result, tuple)
+                chunk_out, chunk_lse = chunk_result
+                out[start:end].copy_(chunk_out)
+                assert out_lse is not None
+                out_lse[start:end].copy_(chunk_lse)
+            else:
+                assert isinstance(chunk_result, torch.Tensor)
+                out[start:end].copy_(chunk_result)
+        if return_lse:
+            assert out_lse is not None
+            return out, out_lse
+        return out
+
     if envs.VLLM_DCP_A2A_PACKED:
         return dcp_a2a_lse_reduce_packed(
             cp_attn_out,

@@ -1611,6 +1611,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Use the experimental packed DCP A2A path, which packs attention output
     # and fp32 LSE into one buffer and uses one all_to_all_single collective.
     "VLLM_DCP_A2A_PACKED": lambda: bool(int(os.getenv("VLLM_DCP_A2A_PACKED", "0"))),
+    # Chunk large DCP A2A combines along the token dimension to avoid transient
+    # prefill OOM from allocating full-size send/recv buffers. Decode batches
+    # are much smaller and are unaffected by this default.
+    "VLLM_DCP_A2A_MAX_TOKENS": lambda: int(
+        os.getenv("VLLM_DCP_A2A_MAX_TOKENS", "16384")
+    ),
     # Log DCP A2A profile summaries every N calls per worker.
     "VLLM_DCP_A2A_PROFILE_INTERVAL": lambda: int(
         os.getenv("VLLM_DCP_A2A_PROFILE_INTERVAL", "100")
