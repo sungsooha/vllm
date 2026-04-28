@@ -1244,6 +1244,25 @@ def get_dcp_group() -> GroupCoordinator:
 # kept for backward compatibility
 get_context_model_parallel_group = get_dcp_group
 
+_TPA_SIZE: int = 0
+
+
+def get_attention_tp_world_size(disable_parallel: bool = False) -> int:
+    if disable_parallel:
+        return 1
+    if _TPA_SIZE > 0:
+        return _TPA_SIZE
+    return get_tensor_model_parallel_world_size()
+
+
+def get_attention_tp_rank(disable_parallel: bool = False) -> int:
+    if disable_parallel:
+        return 0
+    if _TPA_SIZE > 0:
+        return get_tensor_model_parallel_rank() // get_dcp_group().world_size
+    return get_tensor_model_parallel_rank()
+
+
 _PP: GroupCoordinator | None = None
 
 
@@ -1615,6 +1634,16 @@ def initialize_model_parallel(
         group_name="dcp",
     )
 
+    global _TPA_SIZE
+    if parallel_config.tpa_size < parallel_config.tensor_parallel_size:
+        _TPA_SIZE = parallel_config.tpa_size
+        logger.info(
+            "TPA enabled: attention TP=%d, tensor TP=%d, DCP=%d",
+            _TPA_SIZE,
+            parallel_config.tensor_parallel_size,
+            parallel_config.decode_context_parallel_size,
+        )
+
     global _PCP
     assert _PCP is None, "prefill context parallel group is already initialized"
     group_ranks = (
@@ -1874,6 +1903,9 @@ def destroy_model_parallel():
     if _DCP:
         _DCP.destroy()
     _DCP = None
+
+    global _TPA_SIZE
+    _TPA_SIZE = 0
 
     global _PCP
     if _PCP:

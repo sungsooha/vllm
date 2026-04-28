@@ -966,6 +966,8 @@ class DeepseekV4Attention(nn.Module):
         tp_size = get_tensor_model_parallel_world_size()
         assert self.n_heads % tp_size == 0
 
+        tpa_size = vllm_config.parallel_config.tpa_size
+        self.use_tpa = tpa_size < tp_size
         self.n_local_heads = self.n_heads // tp_size
         self.q_lora_rank = config.q_lora_rank
         self.o_lora_rank = config.o_lora_rank
@@ -1012,7 +1014,10 @@ class DeepseekV4Attention(nn.Module):
         )
         self.dcp_world_size = vllm_config.parallel_config.decode_context_parallel_size
         self.wq_b_dcp = None
-        if envs.VLLM_DSV4_DCP_Q_REPLICATE and self.dcp_world_size > 1:
+        self.use_dcp_q_replicate = (
+            envs.VLLM_DSV4_DCP_Q_REPLICATE or self.use_tpa
+        ) and self.dcp_world_size > 1
+        if self.use_dcp_q_replicate:
             dcp_heads = self.n_local_heads * self.dcp_world_size
             self.wq_b_dcp = ReplicatedLinear(
                 self.q_lora_rank,
@@ -1463,11 +1468,7 @@ class DeepseekV4Model(nn.Module):
                     )
                     weight_loader(param, loaded_weight)
                     loaded_params.add(name)
-                    if (
-                        envs.VLLM_DSV4_DCP_Q_REPLICATE
-                        and dcp_world_size > 1
-                        and ".attn.wq_b." in name
-                    ):
+                    if dcp_world_size > 1 and ".attn.wq_b." in name:
                         dcp_name = name.replace(".attn.wq_b.", ".attn.wq_b_dcp.")
                         if dcp_name in params_dict:
                             _load_dsv4_dcp_replicated_column_weight(

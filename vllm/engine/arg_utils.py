@@ -449,6 +449,9 @@ class EngineArgs:
     numa_bind_nodes: list[int] | None = ParallelConfig.numa_bind_nodes
     numa_bind_cpus: list[str] | None = ParallelConfig.numa_bind_cpus
     tensor_parallel_size: int = ParallelConfig.tensor_parallel_size
+    tensor_parallel_size_attention: int | None = (
+        ParallelConfig.tensor_parallel_size_attention
+    )
     prefill_context_parallel_size: int = ParallelConfig.prefill_context_parallel_size
     decode_context_parallel_size: int = ParallelConfig.decode_context_parallel_size
     dcp_comm_backend: DCPCommBackend = ParallelConfig.dcp_comm_backend
@@ -923,6 +926,11 @@ class EngineArgs:
         )
         parallel_group.add_argument(
             "--tensor-parallel-size", "-tp", **parallel_kwargs["tensor_parallel_size"]
+        )
+        parallel_group.add_argument(
+            "--tensor-parallel-size-attention",
+            "-tpa",
+            **parallel_kwargs["tensor_parallel_size_attention"],
         )
         parallel_group.add_argument(
             "--decode-context-parallel-size",
@@ -1895,6 +1903,7 @@ class EngineArgs:
             worker_extension_cls=self.worker_extension_cls,
             decode_context_parallel_size=self.decode_context_parallel_size,
             dcp_comm_backend=self.dcp_comm_backend,
+            tensor_parallel_size_attention=self.tensor_parallel_size_attention,
             dcp_kv_cache_interleave_size=self.dcp_kv_cache_interleave_size,
             cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
             _api_process_count=self._api_process_count,

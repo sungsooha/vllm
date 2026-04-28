@@ -144,6 +144,47 @@ class TestDCPCommBackendConfig:
         assert config.dcp_comm_backend == "ag_rs"
 
 
+class TestAttentionTensorParallelConfig:
+    """Test --tensor-parallel-size-attention config validation."""
+
+    def test_default_matches_tensor_parallel_size(self):
+        config = ParallelConfig(tensor_parallel_size=4)
+        assert config.tensor_parallel_size_attention is None
+        assert config.tpa_size == 4
+
+    def test_valid_tpa_requires_matching_dcp(self):
+        config = ParallelConfig(
+            tensor_parallel_size=16,
+            tensor_parallel_size_attention=8,
+            decode_context_parallel_size=2,
+        )
+        assert config.tpa_size == 8
+
+    def test_tpa_must_be_positive(self):
+        with pytest.raises(
+            ValueError, match="tensor_parallel_size_attention must be positive"
+        ):
+            ParallelConfig(
+                tensor_parallel_size=16,
+                tensor_parallel_size_attention=0,
+            )
+
+    def test_tpa_must_divide_tp(self):
+        with pytest.raises(ValueError, match="must be divisible"):
+            ParallelConfig(
+                tensor_parallel_size=16,
+                tensor_parallel_size_attention=6,
+            )
+
+    def test_tpa_requires_matching_dcp(self):
+        with pytest.raises(ValueError, match="decode_context_parallel_size must equal"):
+            ParallelConfig(
+                tensor_parallel_size=16,
+                tensor_parallel_size_attention=8,
+                decode_context_parallel_size=4,
+            )
+
+
 class TestLSEWeightedCombine:
     """Test LSE-weighted combination logic (CPU only, no GPU).
 
