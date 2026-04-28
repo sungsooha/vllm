@@ -1674,6 +1674,7 @@ class VllmConfig:
         if self.model_config is None:
             return
 
+        self._validate_attention_tensor_parallel()
         self._validate_deepseek_v4_dcp()
 
         # Avoid running try_verify_and_update_config multiple times
@@ -1740,6 +1741,16 @@ class VllmConfig:
             for hf_config in hf_configs
             if hf_config is not None
         )
+
+    def _validate_attention_tensor_parallel(self) -> None:
+        tpa_size = self.parallel_config.tensor_parallel_size_attention
+        if tpa_size is None or tpa_size >= self.parallel_config.tensor_parallel_size:
+            return
+        if not self._is_deepseek_v4_model():
+            raise ValueError(
+                "tensor_parallel_size_attention currently supports only "
+                "DeepSeek V4 in this development branch."
+            )
 
     def _validate_deepseek_v4_dcp(self) -> None:
         """Keep DeepSeek V4 DCP fail-closed until V4 paths are DCP-safe."""
@@ -1835,6 +1846,7 @@ class VllmConfig:
             f"download_dir={self.load_config.download_dir!r}, "
             f"load_format={self.load_config.load_format}, "
             f"tensor_parallel_size={self.parallel_config.tensor_parallel_size}, "  # noqa
+            f"tensor_parallel_size_attention={self.parallel_config.tensor_parallel_size_attention}, "  # noqa
             f"pipeline_parallel_size={self.parallel_config.pipeline_parallel_size}, "  # noqa
             f"data_parallel_size={self.parallel_config.data_parallel_size}, "  # noqa
             f"decode_context_parallel_size={self.parallel_config.decode_context_parallel_size}, "  # noqa

@@ -324,6 +324,12 @@ class ParallelConfig:
       per layer for MLA models.
     """
 
+    tensor_parallel_size_attention: int | None = None
+    """Tensor parallel size used by attention when it differs from FFN TP.
+    When set smaller than tensor_parallel_size, decode context parallelism must
+    cover the remaining factor: DCP = TP / TPA.
+    """
+
     cp_kv_cache_interleave_size: int = 1
     """Interleave size of kv_cache storage while using DCP or PCP.
     For `total_cp_rank = pcp_rank * dcp_world_size + dcp_rank`,
@@ -479,7 +485,36 @@ class ParallelConfig:
                 "dcp_comm_backend='a2a' requires decode_context_parallel_size > 1."
             )
 
+        if self.tensor_parallel_size_attention is not None:
+            tpa_size = self.tensor_parallel_size_attention
+            tp_size = self.tensor_parallel_size
+            if tpa_size <= 0:
+                raise ValueError("tensor_parallel_size_attention must be positive.")
+            if tp_size % tpa_size != 0:
+                raise ValueError(
+                    f"tensor_parallel_size ({tp_size}) must be divisible by "
+                    f"tensor_parallel_size_attention ({tpa_size})."
+                )
+            required_dcp_size = tp_size // tpa_size
+            if (
+                required_dcp_size > 1
+                and self.decode_context_parallel_size != required_dcp_size
+            ):
+                raise ValueError(
+                    f"When tensor_parallel_size_attention ({tpa_size}) is smaller "
+                    f"than tensor_parallel_size ({tp_size}), "
+                    "decode_context_parallel_size must equal "
+                    "tensor_parallel_size / tensor_parallel_size_attention "
+                    f"(= {required_dcp_size}), but got "
+                    f"{self.decode_context_parallel_size}."
+                )
+
         return self
+
+    @property
+    def tpa_size(self) -> int:
+        """Tensor parallel size used by attention."""
+        return self.tensor_parallel_size_attention or self.tensor_parallel_size
 
     @property
     def world_size_across_dp(self) -> int:
