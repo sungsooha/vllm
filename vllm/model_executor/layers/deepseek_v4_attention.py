@@ -75,7 +75,10 @@ from vllm.v1.attention.backends.mla.indexer import (
 )
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
 from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
-from vllm.v1.attention.ops.dcp_alltoall import dcp_a2a_lse_reduce
+from vllm.v1.attention.ops.dcp_alltoall import (
+    dcp_a2a_lse_reduce,
+    dcp_a2a_packed_workspace_specs,
+)
 from vllm.v1.attention.ops.flashmla import (
     flash_mla_sparse_fwd,
     flash_mla_with_kvcache,
@@ -558,7 +561,7 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                 else (sub.max_model_len + sub.compress_ratio - 1) // sub.compress_ratio
             )
             M = N + sub.window_size + sub.max_num_batched_tokens
-            prefill_workspaces = [
+            prefill_workspaces: list[tuple[tuple[int, ...], torch.dtype]] = [
                 ((PREFILL_CHUNK_SIZE, M, q.shape[-1]), torch.bfloat16)
             ]
             if sub.dcp_world_size > 1:
@@ -574,6 +577,15 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                             q.shape[-1],
                         ),
                         q.dtype,
+                    )
+                )
+                prefill_workspaces.extend(
+                    dcp_a2a_packed_workspace_specs(
+                        num_tokens=sub.max_num_batched_tokens,
+                        padded_global_heads=padded_global_heads,
+                        head_dim=q.shape[-1],
+                        dcp_world_size=sub.dcp_world_size,
+                        output_dtype=q.dtype,
                     )
                 )
             current_workspace_manager().get_simultaneous(*prefill_workspaces)
@@ -1026,13 +1038,25 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         partial_lse: torch.Tensor,
         output: torch.Tensor,
         padded_local_heads: int,
+        send_buffer: torch.Tensor | None = None,
+        recv_buffer: torch.Tensor | None = None,
     ) -> None:
-        combined_out, combined_lse = self.dcp_combine(
-            partial_out,
-            partial_lse,
-            get_dcp_group(),
-            return_lse=True,
-        )
+        if self.dcp_combine is dcp_a2a_lse_reduce:
+            combined_out, combined_lse = self.dcp_combine(
+                partial_out,
+                partial_lse,
+                get_dcp_group(),
+                return_lse=True,
+                send_buffer=send_buffer,
+                recv_buffer=recv_buffer,
+            )
+        else:
+            combined_out, combined_lse = self.dcp_combine(
+                partial_out,
+                partial_lse,
+                get_dcp_group(),
+                return_lse=True,
+            )
         assert combined_out.shape == (
             output.shape[0],
             padded_local_heads,
@@ -1140,10 +1164,28 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         )
 
         flash_output = output
+        a2a_send_buffer = None
+        a2a_recv_buffer = None
         if self.dcp_world_size > 1:
-            (flash_output,) = current_workspace_manager().get_simultaneous(
+            decode_specs: list[tuple[tuple[int, ...], torch.dtype]] = [
                 ((num_decode_tokens, q_flash.shape[2], self.head_dim), q.dtype),
+            ]
+            decode_specs.extend(
+                dcp_a2a_packed_workspace_specs(
+                    num_tokens=num_decode_tokens,
+                    padded_global_heads=q_flash.shape[2],
+                    head_dim=self.head_dim,
+                    dcp_world_size=self.dcp_world_size,
+                    output_dtype=q.dtype,
+                )
             )
+            decode_workspaces = current_workspace_manager().get_simultaneous(
+                *decode_specs
+            )
+            flash_output = decode_workspaces[0]
+            if len(decode_workspaces) >= 3:
+                a2a_send_buffer = decode_workspaces[1]
+                a2a_recv_buffer = decode_workspaces[2]
 
         out, lse = flash_mla_with_kvcache(
             q=q_flash,
@@ -1178,6 +1220,8 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 partial_lse,
                 output,
                 padded_local_heads,
+                send_buffer=a2a_send_buffer,
+                recv_buffer=a2a_recv_buffer,
             )
 
     def _forward_prefill(
@@ -1267,9 +1311,11 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 query_start_loc_cpu[num_decodes + chunk_end] - prefill_token_base
             ).item()
 
-            prefill_workspaces = [
+            prefill_workspaces: list[tuple[tuple[int, ...], torch.dtype]] = [
                 ((PREFILL_CHUNK_SIZE, M, q.shape[-1]), torch.bfloat16),
             ]
+            a2a_send_buffer: torch.Tensor | None = None
+            a2a_recv_buffer: torch.Tensor | None = None
             if self.dcp_world_size > 1:
                 prefill_workspaces.append(
                     (
@@ -1281,9 +1327,24 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                         q.dtype,
                     )
                 )
+                prefill_workspaces.extend(
+                    dcp_a2a_packed_workspace_specs(
+                        num_tokens=max_chunk_tokens,
+                        padded_global_heads=dcp_padded_global_heads,
+                        head_dim=self.head_dim,
+                        dcp_world_size=self.dcp_world_size,
+                        output_dtype=q.dtype,
+                    )
+                )
             workspaces = workspace_manager.get_simultaneous(*prefill_workspaces)
             kv = workspaces[0]
-            flash_output_workspace = workspaces[1] if self.dcp_world_size > 1 else None
+            if self.dcp_world_size > 1:
+                flash_output_workspace = workspaces[1]
+                if len(workspaces) >= 4:
+                    a2a_send_buffer = workspaces[2]
+                    a2a_recv_buffer = workspaces[3]
+            else:
+                flash_output_workspace = None
 
             if not swa_only:
                 # Gather compressed KV
@@ -1376,6 +1437,8 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                     partial_lse,
                     output[query_start:query_end],
                     padded_local_heads,
+                    send_buffer=a2a_send_buffer,
+                    recv_buffer=a2a_recv_buffer,
                 )
 
 

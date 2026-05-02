@@ -112,6 +112,39 @@ def _dcp_a2a_lse_pack_dim(output_dtype: torch.dtype) -> int:
     raise ValueError(f"Cannot pack fp32 LSE into output dtype {output_dtype}.")
 
 
+def dcp_a2a_packed_workspace_specs(
+    num_tokens: int,
+    padded_global_heads: int,
+    head_dim: int,
+    dcp_world_size: int,
+    output_dtype: torch.dtype,
+) -> list[tuple[tuple[int, ...], torch.dtype]]:
+    """
+    Return workspace specs for DCP A2A packed send/recv staging buffers.
+
+    Callers reserve these alongside their other workspace tensors in a single
+    `current_workspace_manager().get_simultaneous(...)` call, so that all live
+    DCP buffers (KV gather, FlashMLA output, A2A send, A2A recv) are sized
+    before the workspace locks. This avoids a second `get_simultaneous` call
+    inside `dcp_a2a_lse_reduce` that would otherwise grow the workspace after
+    lock and break CUDA graph invariants.
+
+    Returns 2 specs (send + recv), each `((world_size, B, H_per_rank,
+    D + lse_pack_dim), dtype)`. If `dcp_world_size == 1`, returns an empty
+    list (A2A is a no-op in that case).
+    """
+    if dcp_world_size == 1:
+        return []
+    assert padded_global_heads % dcp_world_size == 0, (
+        f"padded_global_heads={padded_global_heads} must be divisible by "
+        f"dcp_world_size={dcp_world_size}"
+    )
+    h_per_rank = padded_global_heads // dcp_world_size
+    lse_pack_dim = _dcp_a2a_lse_pack_dim(output_dtype)
+    shape = (dcp_world_size, num_tokens, h_per_rank, head_dim + lse_pack_dim)
+    return [(shape, output_dtype), (shape, output_dtype)]
+
+
 def _dcp_a2a_send_recv_buffers(
     shape: tuple[int, ...],
     device: torch.device,
@@ -397,6 +430,8 @@ def dcp_a2a_lse_reduce(
     ctx: CPTritonContext | None = None,
     return_lse: bool = False,
     is_lse_base_on_e: bool = True,
+    send_buffer: torch.Tensor | None = None,
+    recv_buffer: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
     Combine partial attention outputs across DCP ranks using All-to-All.
@@ -411,6 +446,14 @@ def dcp_a2a_lse_reduce(
         ctx: CPTritonContext (unused, for signature compatibility)
         return_lse: If True, also return the combined global LSE
         is_lse_base_on_e: If True, LSE is base e; if False, base 2
+        send_buffer: Optional preallocated send staging buffer of shape
+            (world_size, B, H_per_rank, D + lse_pack_dim) with dtype matching
+            `cp_attn_out`. When provided together with `recv_buffer`, skips
+            the internal workspace allocation. Use `dcp_a2a_packed_workspace_specs`
+            to reserve these alongside other workspace tensors in a single
+            `get_simultaneous` call.
+        recv_buffer: Optional preallocated recv staging buffer (same constraints
+            as `send_buffer`).
 
     Returns:
         Combined output [B, H/N, D] (head-scattered)
@@ -429,11 +472,30 @@ def dcp_a2a_lse_reduce(
     H_per_rank = H // world_size
     lse_pack_dim = _dcp_a2a_lse_pack_dim(cp_attn_out.dtype)
 
-    send_buffer, recv_buffer = _dcp_a2a_send_recv_buffers(
-        (world_size, B, H_per_rank, D + lse_pack_dim),
-        device=cp_attn_out.device,
-        dtype=cp_attn_out.dtype,
-    )
+    expected_shape = (world_size, B, H_per_rank, D + lse_pack_dim)
+    if send_buffer is not None and recv_buffer is not None:
+        assert tuple(send_buffer.shape) == expected_shape, (
+            f"preallocated send_buffer shape {tuple(send_buffer.shape)} "
+            f"does not match expected {expected_shape}"
+        )
+        assert tuple(recv_buffer.shape) == expected_shape, (
+            f"preallocated recv_buffer shape {tuple(recv_buffer.shape)} "
+            f"does not match expected {expected_shape}"
+        )
+        assert send_buffer.dtype == cp_attn_out.dtype, (
+            f"preallocated send_buffer dtype {send_buffer.dtype} "
+            f"does not match cp_attn_out dtype {cp_attn_out.dtype}"
+        )
+        assert recv_buffer.dtype == cp_attn_out.dtype, (
+            f"preallocated recv_buffer dtype {recv_buffer.dtype} "
+            f"does not match cp_attn_out dtype {cp_attn_out.dtype}"
+        )
+    else:
+        send_buffer, recv_buffer = _dcp_a2a_send_recv_buffers(
+            expected_shape,
+            device=cp_attn_out.device,
+            dtype=cp_attn_out.dtype,
+        )
 
     _dcp_a2a_pack_send(
         cp_attn_out,
