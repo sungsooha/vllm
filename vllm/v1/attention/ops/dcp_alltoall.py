@@ -386,8 +386,19 @@ def _dcp_a2a_unpack_combine(
     lse_pack_dim: int,
     return_lse: bool,
     is_lse_base_on_e: bool,
+    actual_num_tokens: int | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    world_size, num_tokens, h_per_rank, _ = recv_buffer.shape
+    world_size, buffer_num_tokens, h_per_rank, _ = recv_buffer.shape
+    # Buffer may be over-allocated for max-chunk sizing while this call only
+    # carries valid data for the first ``actual_num_tokens`` rows per rank.
+    num_tokens = (
+        actual_num_tokens if actual_num_tokens is not None else buffer_num_tokens
+    )
+    if num_tokens > buffer_num_tokens:
+        raise ValueError(
+            f"actual_num_tokens={num_tokens} exceeds recv_buffer "
+            f"capacity={buffer_num_tokens}."
+        )
     out = torch.empty(
         (num_tokens, h_per_rank, head_dim),
         device=recv_buffer.device,
@@ -447,11 +458,15 @@ def dcp_a2a_lse_reduce(
         return_lse: If True, also return the combined global LSE
         is_lse_base_on_e: If True, LSE is base e; if False, base 2
         send_buffer: Optional preallocated send staging buffer of shape
-            (world_size, B, H_per_rank, D + lse_pack_dim) with dtype matching
-            `cp_attn_out`. When provided together with `recv_buffer`, skips
-            the internal workspace allocation. Use `dcp_a2a_packed_workspace_specs`
+            (world_size, B_capacity, H_per_rank, D + lse_pack_dim) with dtype
+            matching `cp_attn_out`. ``B_capacity`` may be greater than this
+            call's actual ``B`` (e.g. when the caller pre-allocates for the
+            largest sub-chunk in a forward and reuses the buffer for smaller
+            sub-chunks). When provided together with `recv_buffer`, skips the
+            internal workspace allocation. Use `dcp_a2a_packed_workspace_specs`
             to reserve these alongside other workspace tensors in a single
-            `get_simultaneous` call.
+            `get_simultaneous` call. If shape is incompatible, falls back to
+            a fresh per-call allocation.
         recv_buffer: Optional preallocated recv staging buffer (same constraints
             as `send_buffer`).
 
@@ -474,23 +489,32 @@ def dcp_a2a_lse_reduce(
 
     expected_shape = (world_size, B, H_per_rank, D + lse_pack_dim)
     if send_buffer is not None and recv_buffer is not None:
-        assert tuple(send_buffer.shape) == expected_shape, (
-            f"preallocated send_buffer shape {tuple(send_buffer.shape)} "
-            f"does not match expected {expected_shape}"
-        )
-        assert tuple(recv_buffer.shape) == expected_shape, (
-            f"preallocated recv_buffer shape {tuple(recv_buffer.shape)} "
-            f"does not match expected {expected_shape}"
-        )
-        assert send_buffer.dtype == cp_attn_out.dtype, (
-            f"preallocated send_buffer dtype {send_buffer.dtype} "
-            f"does not match cp_attn_out dtype {cp_attn_out.dtype}"
-        )
-        assert recv_buffer.dtype == cp_attn_out.dtype, (
-            f"preallocated recv_buffer dtype {recv_buffer.dtype} "
-            f"does not match cp_attn_out dtype {cp_attn_out.dtype}"
-        )
-    else:
+        # Preallocated buffers may be sized for the maximum sub-chunk in a
+        # forward (capacity ``B_cap >= B``); only the leading ``B`` rows per
+        # rank carry valid data for this call. Validate the constant dims and
+        # capacity, and fall back to a per-call allocation if anything else
+        # mismatches.
+        s = tuple(send_buffer.shape)
+        r = tuple(recv_buffer.shape)
+        if not (
+            len(s) == 4
+            and len(r) == 4
+            and s[0] == world_size
+            and r[0] == world_size
+            and s[1] >= B
+            and r[1] >= B
+            and s[2] == H_per_rank
+            and r[2] == H_per_rank
+            and s[3] == D + lse_pack_dim
+            and r[3] == D + lse_pack_dim
+            and s[1] == r[1]
+            and send_buffer.dtype == cp_attn_out.dtype
+            and recv_buffer.dtype == cp_attn_out.dtype
+        ):
+            send_buffer = None
+            recv_buffer = None
+
+    if send_buffer is None or recv_buffer is None:
         send_buffer, recv_buffer = _dcp_a2a_send_recv_buffers(
             expected_shape,
             device=cp_attn_out.device,
@@ -516,5 +540,10 @@ def dcp_a2a_lse_reduce(
     work.wait()
 
     return _dcp_a2a_unpack_combine(
-        recv_buffer, D, lse_pack_dim, return_lse, is_lse_base_on_e
+        recv_buffer,
+        D,
+        lse_pack_dim,
+        return_lse,
+        is_lse_base_on_e,
+        actual_num_tokens=B,
     )

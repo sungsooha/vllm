@@ -374,6 +374,65 @@ class TestPackedA2AKernels:
         else:
             _assert_packed_a2a_close(actual, expected_out, dtype)
 
+    @pytest.mark.skipif(
+        torch.accelerator.device_count() < 1, reason="CUDA is required."
+    )
+    @pytest.mark.parametrize("dtype_name", ["float16", "bfloat16", "float32"])
+    def test_unpack_with_oversized_buffer_matches_reference(
+        self,
+        dtype_name: str,
+    ):
+        """Caller may pre-allocate the recv buffer for the largest sub-chunk
+        in a forward and reuse it for smaller sub-chunks; only the leading
+        ``actual_num_tokens`` rows per rank carry valid data.
+        """
+        from vllm.v1.attention.ops.dcp_alltoall import (
+            _dcp_a2a_lse_pack_dim,
+            _dcp_a2a_pack_send,
+            _dcp_a2a_unpack_combine,
+        )
+
+        torch.manual_seed(0)
+        dtype = _dtype_from_name(dtype_name)
+        device = torch.device("cuda")
+        world_size, B_actual, B_capacity, h_per_rank, D = 4, 3, 7, 2, 32
+        H = world_size * h_per_rank
+        cp_attn_out = torch.randn(B_actual, H, D, device=device, dtype=dtype)
+        cp_attn_lse = torch.randn(B_actual, H, device=device, dtype=torch.float32)
+        lse_pack_dim = _dcp_a2a_lse_pack_dim(dtype)
+        # Over-sized buffer (capacity > actual); rows past B_actual carry garbage.
+        send_buffer = torch.randn(
+            (world_size, B_capacity, h_per_rank, D + lse_pack_dim),
+            device=device,
+            dtype=dtype,
+        )
+
+        _dcp_a2a_pack_send(
+            cp_attn_out,
+            cp_attn_lse,
+            send_buffer,
+            world_size,
+            h_per_rank,
+            D,
+            lse_pack_dim,
+        )
+        actual_out, actual_lse = _dcp_a2a_unpack_combine(
+            send_buffer,
+            D,
+            lse_pack_dim,
+            return_lse=True,
+            is_lse_base_on_e=True,
+            actual_num_tokens=B_actual,
+        )
+        expected_out, expected_lse = _packed_a2a_reference(
+            cp_attn_out, cp_attn_lse, world_size, h_per_rank, True
+        )
+
+        assert actual_out.shape == (B_actual, h_per_rank, D)
+        assert actual_lse.shape == (B_actual, h_per_rank)
+        _assert_packed_a2a_close(actual_out, expected_out, dtype)
+        torch.testing.assert_close(actual_lse, expected_lse, rtol=1e-4, atol=1e-4)
+
 
 def _distributed_packed_a2a_worker(env: dict[str, str]) -> None:
     update_environment_variables(env)
