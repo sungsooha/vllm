@@ -330,6 +330,15 @@ class BatchDCPPrefillWrapper:
         )
         lse_query = lse_query.transpose(0, 1).contiguous()
 
+        # FlashInfer returns LSE in log2 base; merge_attn_states expects
+        # natural-log (CUDA kernel uses expf/logf). Both branches arrive
+        # here in log2 (lse_context via dcp_combine with
+        # is_lse_base_on_e=False, lse_query directly from FlashInfer).
+        # Convert both before the merge. (12a2721bb.)
+        LN2 = 0.6931471805599453
+        lse_context = lse_context * LN2
+        lse_query = lse_query * LN2
+
         # Under TPA-GQA: output_query has H/TPA heads. merge_attn_states
         # needs both branches to have the same heads count (= H/TP per rank
         # after the context-side reduce-scatter). Slice output_query/lse_query
