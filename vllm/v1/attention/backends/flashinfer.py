@@ -356,7 +356,7 @@ class BatchDCPPrefillWrapper:
             head_start = dcp_rank * heads_per_full_rank
             head_end = head_start + heads_per_full_rank
             output_query = output_query[:, head_start:head_end, :].contiguous()
-            lse_query = lse_query[:, head_start:head_end].contiguous()
+            lse_query = lse_query[head_start:head_end, :].contiguous()
 
         merge_attn_states(
             out,
