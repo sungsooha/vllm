@@ -46,6 +46,7 @@ import vllm.envs as envs
 from vllm.distributed.device_communicators.base_device_communicator import (
     DeviceCommunicatorBase,
 )
+from vllm.distributed.layer_parallel_config import init_layer_parallel_resolver
 from vllm.distributed.utils import (
     StatelessProcessGroup,
     get_cached_tcp_store_client,
@@ -1719,6 +1720,36 @@ def initialize_model_parallel(
                 )
     # If no EP group needed, _EP remains None
     # If no EPLB group needed, _EPLB remains None
+
+    # Initialize the per-layer parallel config resolver.
+    # When `tensor_parallel_size_attention` (TPA) is set and smaller than the
+    # full TP size, attention layers read a per-layer TP from the resolver
+    # instead of the global TP world. See
+    # `vllm/distributed/layer_parallel_config.py`. Non-attention layers and
+    # the no-TPA case always fall back to the global TP world, so this is a
+    # no-op for unmigrated code paths.
+    full_tp_size = tensor_model_parallel_size
+    full_tp_rank = _TP.rank_in_group
+    attn_tp_size = (
+        getattr(parallel_config, "tensor_parallel_size_attention", 0) or full_tp_size
+    )
+    if attn_tp_size > full_tp_size:
+        raise ValueError(
+            f"tensor_parallel_size_attention ({attn_tp_size}) cannot exceed "
+            f"tensor_model_parallel_size ({full_tp_size})"
+        )
+    if full_tp_size % attn_tp_size != 0:
+        raise ValueError(
+            f"tensor_model_parallel_size ({full_tp_size}) must be divisible "
+            f"by tensor_parallel_size_attention ({attn_tp_size})"
+        )
+    attn_tp_rank = full_tp_rank % attn_tp_size
+    init_layer_parallel_resolver(
+        full_tp_size=full_tp_size,
+        full_tp_rank=full_tp_rank,
+        attn_tp_size=attn_tp_size,
+        attn_tp_rank=attn_tp_rank,
+    )
 
     logger.info_once(
         "rank %s in world size %s is assigned as "
