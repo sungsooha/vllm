@@ -781,6 +781,9 @@ class VllmConfig:
 
         if self.model_config is not None:
             self.model_config.verify_with_parallel_config(self.parallel_config)
+            self.parallel_config.verify_tpa_with_model_architecture(
+                self.model_config.architecture
+            )
             self.model_config.verify_dual_chunk_attention_config(self.load_config)
 
             self.parallel_config.is_moe_model = self.model_config.is_moe
@@ -1843,6 +1846,7 @@ class VllmConfig:
             f"download_dir={self.load_config.download_dir!r}, "
             f"load_format={self.load_config.load_format}, "
             f"tensor_parallel_size={self.parallel_config.tensor_parallel_size}, "  # noqa
+            f"tensor_parallel_size_attention={self.parallel_config.tensor_parallel_size_attention}, "  # noqa
             f"pipeline_parallel_size={self.parallel_config.pipeline_parallel_size}, "  # noqa
             f"data_parallel_size={self.parallel_config.data_parallel_size}, "  # noqa
             f"decode_context_parallel_size={self.parallel_config.decode_context_parallel_size}, "  # noqa

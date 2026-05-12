@@ -50,6 +50,13 @@ All2AllBackend = Literal[
     "flashinfer_nvlink_one_sided",
 ]
 
+TPA_SUPPORTED_MODEL_ARCHITECTURES = frozenset(
+    {
+        "LlamaForCausalLM",
+        "NemotronForCausalLM",
+    }
+)
+
 
 @config
 class EPLBConfig:
@@ -112,6 +119,13 @@ class ParallelConfig:
     """Number of pipeline parallel groups."""
     tensor_parallel_size: int = 1
     """Number of tensor parallel groups."""
+    tensor_parallel_size_attention: int | None = Field(default=None, gt=0)
+    """Tensor parallel size for attention layers.
+
+    When set smaller than ``tensor_parallel_size``, attention projection
+    weights are sharded by this value while non-attention layers keep the full
+    tensor-parallel width. v1 is whitelist-gated to GQA-family models.
+    """
     prefill_context_parallel_size: int = 1
     """Number of prefill context parallel groups."""
     data_parallel_size: int = 1
@@ -482,7 +496,51 @@ class ParallelConfig:
                 "dcp_comm_backend='a2a' requires decode_context_parallel_size > 1."
             )
 
+        if self.tensor_parallel_size_attention is not None:
+            tpa = self.tensor_parallel_size_attention
+            tp = self.tensor_parallel_size
+            if tpa > tp:
+                raise ValueError(
+                    f"tensor_parallel_size_attention ({tpa}) cannot exceed "
+                    f"tensor_parallel_size ({tp})."
+                )
+            if tp % tpa != 0:
+                raise ValueError(
+                    f"tensor_parallel_size ({tp}) must be divisible by "
+                    f"tensor_parallel_size_attention ({tpa})."
+                )
+            required_dcp = tp // tpa
+            if required_dcp > 1 and self.decode_context_parallel_size != required_dcp:
+                raise ValueError(
+                    f"When tensor_parallel_size_attention ({tpa}) is smaller than "
+                    f"tensor_parallel_size ({tp}), decode_context_parallel_size "
+                    f"must equal tensor_parallel_size / "
+                    f"tensor_parallel_size_attention (= {required_dcp}), but got "
+                    f"{self.decode_context_parallel_size}."
+                )
+
         return self
+
+    @property
+    def tpa_size(self) -> int:
+        """Return the effective attention tensor-parallel size."""
+        return self.tensor_parallel_size_attention or self.tensor_parallel_size
+
+    @property
+    def tpa_enabled(self) -> bool:
+        return self.tpa_size != self.tensor_parallel_size
+
+    def verify_tpa_with_model_architecture(self, architecture: str | None) -> None:
+        """Validate that TPA is only enabled for the v1 whitelist."""
+        if not self.tpa_enabled:
+            return
+        if architecture not in TPA_SUPPORTED_MODEL_ARCHITECTURES:
+            supported = ", ".join(sorted(TPA_SUPPORTED_MODEL_ARCHITECTURES))
+            raise ValueError(
+                "tensor_parallel_size_attention is only supported for "
+                f"{supported} in this v1 implementation, but got "
+                f"{architecture!r}."
+            )
 
     @property
     def world_size_across_dp(self) -> int:
