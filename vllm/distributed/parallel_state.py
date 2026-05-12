@@ -1232,6 +1232,25 @@ def get_tp_group() -> GroupCoordinator:
     return _TP
 
 
+# TPA-GQA mode: when tensor_parallel_size_attention < tensor_parallel_size,
+# attention backends must skip the pre-attention DCP Q-all-gather and let the
+# existing dcp_combine reduce-scatter heads to H/TP for o_proj. Initialized
+# in initialize_model_parallel() once the resolver is set up. Reset by
+# destroy_model_parallel().
+_TPA_GQA_MODE: bool = False
+
+
+def is_tpa_gqa_mode() -> bool:
+    """Return True iff TPA<TP is active (attention TP smaller than full TP).
+
+    Consumed by attention backends to skip the pre-attention DCP Q-all-gather:
+    under TPA<TP, queries are already sized for the attention TP group, so the
+    old DCP-all-gather is incorrect (it would all-gather to H/TPA*DCP rather
+    than letting the post-attention combine reduce-scatter to H/TP).
+    """
+    return _TPA_GQA_MODE
+
+
 _DCP: GroupCoordinator | None = None
 
 
@@ -1756,6 +1775,14 @@ def initialize_model_parallel(
         )
     dcp_size_for_attn = full_tp_size // attn_tp_size
     attn_tp_rank = full_tp_rank // dcp_size_for_attn
+
+    # TPA-GQA mode flag, consumed by attention backends to switch off the
+    # pre-attention DCP Q-all-gather (queries are already per-attn-rank under
+    # TPA<TP) and let the existing dcp_combine reduce-scatter heads from
+    # H/TPA → H/(TPA*DCP) = H/TP, which is what o_proj expects.
+    global _TPA_GQA_MODE
+    _TPA_GQA_MODE = attn_tp_size > 1 and attn_tp_size < full_tp_size
+
     init_layer_parallel_resolver(
         full_tp_size=full_tp_size,
         full_tp_rank=full_tp_rank,
@@ -1940,6 +1967,13 @@ def destroy_model_parallel():
     if _EPLB:
         _EPLB.destroy()
     _EPLB = None
+
+    # Reset TPA-GQA mode + per-layer resolver state so subsequent inits start clean.
+    global _TPA_GQA_MODE
+    _TPA_GQA_MODE = False
+    from vllm.distributed.layer_parallel_config import clear_layer_parallel_resolver
+
+    clear_layer_parallel_resolver()
 
 
 def destroy_distributed_environment():

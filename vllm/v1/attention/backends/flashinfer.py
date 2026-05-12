@@ -245,12 +245,21 @@ class BatchDCPPrefillWrapper:
         disable_split_kv: bool,
     ):
         """Plan the prefill operation with given parameters."""
+        from vllm.distributed.parallel_state import is_tpa_gqa_mode
+
+        # Under TPA-GQA, queries are per-attention-rank (H/TPA heads per
+        # rank) and the pre-attention DCP all-gather is skipped. So the
+        # context wrapper sees `num_qo_heads` directly. Without TPA, the
+        # all-gather expands queries to H/TPA * dcp = H/TP * dcp heads.
+        context_num_qo_heads = (
+            num_qo_heads if is_tpa_gqa_mode() else num_qo_heads * dcp_world_size
+        )
         self._context.plan(
             qo_indptr=qo_indptr_cpu,
             paged_kv_indptr=paged_kv_indptr_cpu,
             paged_kv_indices=paged_kv_indices,
             paged_kv_last_page_len=paged_kv_last_page_len_cpu,
-            num_qo_heads=num_qo_heads * dcp_world_size,
+            num_qo_heads=context_num_qo_heads,
             num_kv_heads=num_kv_heads,
             head_dim_qk=head_dim,
             page_size=page_size,
@@ -286,11 +295,20 @@ class BatchDCPPrefillWrapper:
         value: torch.Tensor,
         out: torch.Tensor,
     ):
-        prefill_query_across_dcp = get_dcp_group().all_gather(
-            prefill_query.contiguous(), dim=1
-        )
+        from vllm.distributed.parallel_state import is_tpa_gqa_mode
+
+        # Under TPA-GQA: query is already per-attention-rank (H/TPA heads).
+        # Skip the cross-DCP all-gather; the dcp_combine below will reduce-
+        # scatter heads from H/TPA → H/TP, which matches o_proj's expected
+        # input dim and what merge_attn_states needs from output_query.
+        if is_tpa_gqa_mode():
+            prefill_query_for_context = prefill_query.contiguous()
+        else:
+            prefill_query_for_context = get_dcp_group().all_gather(
+                prefill_query.contiguous(), dim=1
+            )
         output_context_tmp, lse_context_tmp = self._context.run(
-            prefill_query_across_dcp,
+            prefill_query_for_context,
             kv_cache_permute,
             k_scale=layer._k_scale_float,
             v_scale=layer._v_scale_float,
@@ -311,6 +329,25 @@ class BatchDCPPrefillWrapper:
             return_lse=True,
         )
         lse_query = lse_query.transpose(0, 1).contiguous()
+
+        # Under TPA-GQA: output_query has H/TPA heads. merge_attn_states
+        # needs both branches to have the same heads count (= H/TP per rank
+        # after the context-side reduce-scatter). Slice output_query/lse_query
+        # to this rank's DCP-rank window so the merge is shape-aligned.
+        if is_tpa_gqa_mode():
+            dcp_group = get_dcp_group()
+            dcp_size = dcp_group.world_size
+            dcp_rank = dcp_group.rank_in_group
+            total_heads = output_query.shape[1]
+            assert total_heads % dcp_size == 0, (
+                f"TPA-GQA: output_query heads ({total_heads}) must be "
+                f"divisible by dcp_size ({dcp_size})"
+            )
+            heads_per_full_rank = total_heads // dcp_size
+            head_start = dcp_rank * heads_per_full_rank
+            head_end = head_start + heads_per_full_rank
+            output_query = output_query[:, head_start:head_end, :].contiguous()
+            lse_query = lse_query[:, head_start:head_end].contiguous()
 
         merge_attn_states(
             out,
@@ -1220,6 +1257,17 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 o_dtype = (
                     FP8_DTYPE if self.is_kvcache_nvfp4 else self.model_config.dtype
                 )
+                # Under TPA-GQA mode, queries are already per-attention-rank
+                # so the pre-attention DCP Q-all-gather is skipped; pass
+                # num_qo_heads as-is. Without TPA, the all-gather expands
+                # queries by dcp_world_size and the wrapper must match.
+                from vllm.distributed.parallel_state import is_tpa_gqa_mode
+
+                decode_num_qo_heads = (
+                    self.num_qo_heads
+                    if is_tpa_gqa_mode()
+                    else self.num_qo_heads * self.dcp_world_size
+                )
                 fast_plan_decode(
                     decode_wrapper,
                     indptr_cpu=self.paged_kv_indptr.cpu[: num_input_tokens + 1],
@@ -1227,7 +1275,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     last_page_len_cpu=self.paged_kv_last_page_len.cpu[
                         :num_input_tokens
                     ],
-                    num_qo_heads=self.num_qo_heads * self.dcp_world_size,
+                    num_qo_heads=decode_num_qo_heads,
                     num_kv_heads=self.num_kv_heads,
                     head_dim=self.head_dim,
                     page_size=self.page_size,
@@ -1709,9 +1757,18 @@ class FlashInferImpl(AttentionImpl):
                     out_decode = output[:num_decode_tokens]
 
                 if use_dcp:
-                    decode_query = get_dcp_group().all_gather(
-                        decode_query.contiguous(), dim=-2
-                    )
+                    # Under TPA-GQA, queries are already per-attention-rank
+                    # (H/TPA heads) — skip the cross-DCP all-gather and let
+                    # dcp_combine reduce-scatter from H/TPA → H/TP. Without
+                    # TPA, all-gather expands heads to H/TPA*DCP.
+                    from vllm.distributed.parallel_state import is_tpa_gqa_mode
+
+                    if not is_tpa_gqa_mode():
+                        decode_query = get_dcp_group().all_gather(
+                            decode_query.contiguous(), dim=-2
+                        )
+                    else:
+                        decode_query = decode_query.contiguous()
                     output_tmp = torch.empty_like(decode_query)
                     lse = torch.empty(
                         (decode_query.size(0), decode_query.size(1)),

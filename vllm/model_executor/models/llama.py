@@ -158,10 +158,13 @@ class LlamaAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.qkv_proj",
         )
+        # Per-layer policy idiom: read the QKV-shape contract from the layer
+        # instead of recomputing it locally. Future per-layer features (TPA,
+        # Q-rep, etc.) change the per-rank head count inside QKVParallelLinear;
+        # this model code never needs another edit because it just reads what
+        # the layer decided.
         self.num_heads = self.qkv_proj.num_heads_per_rank
         self.num_kv_heads = self.qkv_proj.num_kv_heads_per_rank
-        self.q_size = self.num_heads * self.head_dim
-        self.kv_size = self.num_kv_heads * self.head_dim
 
         self.o_proj = RowParallelLinear(
             input_size=self.total_num_heads * self.head_dim,
@@ -218,7 +221,7 @@ class LlamaAttention(nn.Module):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        q, k, v = self.qkv_proj.split_qkv(qkv)
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)

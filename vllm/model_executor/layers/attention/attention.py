@@ -446,14 +446,38 @@ class Attention(nn.Module, AttentionLayerBase):
             # Handle both 2D [num_tokens, hidden] and
             # 3D [num_tokens, heads, head_dim] query
             num_tokens = query.shape[0]
-            output_shape = torch.Size((num_tokens, self.num_heads * self.head_size_v))
+            # Under TPA-GQA, self.num_heads is per-attention-rank
+            # (= total_heads / attn_tp_size). After the DCP combine inside
+            # the attention backend reduce-scatters heads across the DCP
+            # group, this rank holds (num_heads / dcp_size) heads. The
+            # output buffer must match that final per-rank head count so
+            # o_proj (RowParallelLinear sized for hidden / full_tp) sees
+            # the correct input shape.
+            from vllm.distributed.parallel_state import (
+                get_dcp_group,
+                is_tpa_gqa_mode,
+            )
+
+            if is_tpa_gqa_mode():
+                dcp_size = get_dcp_group().world_size
+                out_num_heads = self.num_heads // dcp_size
+            else:
+                out_num_heads = self.num_heads
+            output_shape = torch.Size((num_tokens, out_num_heads * self.head_size_v))
         output = torch.empty(output_shape, dtype=output_dtype, device=query.device)
         hidden_size = output_shape[-1]
         # Reshape the query, key, and value tensors.
         # NOTE(woosuk): We do this outside the custom op to minimize the
         # CPU overheads from the non-CUDA-graph regions.
         query = query.view(-1, self.num_heads, self.head_size)
-        output = output.view(-1, self.num_heads, self.head_size_v)
+        # The output view uses the post-combine head count (out_num_heads)
+        # under TPA-GQA, which equals self.num_heads when TPA is inactive.
+        out_view_heads = (
+            self.num_heads
+            if not is_tpa_gqa_mode()
+            else self.num_heads // get_dcp_group().world_size
+        )
+        output = output.view(-1, out_view_heads, self.head_size_v)
         if key is not None:
             key = key.view(-1, self.num_kv_heads, self.head_size)
         if value is not None:
