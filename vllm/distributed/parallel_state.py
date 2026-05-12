@@ -1728,6 +1728,17 @@ def initialize_model_parallel(
     # `vllm/distributed/layer_parallel_config.py`. Non-attention layers and
     # the no-TPA case always fall back to the global TP world, so this is a
     # no-op for unmigrated code paths.
+    #
+    # Attention TP rank derivation matches the DCP-group layout above:
+    # DCP groups are constructed as consecutive chunks of the TP axis
+    # (`all_ranks.reshape(-1, dcp_size).unbind(0)`), so for TP=4/DCP=2 the
+    # DCP groups are {0,1} and {2,3}. The attention TP rank is therefore
+    # WHICH DCP group this rank belongs to, i.e. `tp_rank // dcp_size`.
+    # This matches `dcp-tpa-separation`'s `get_attention_tp_rank` (PR
+    # #36287 upstream-aiming branch) and the `tpa-per-layer-config`
+    # prototype that was gsm8k-validated at 0.765. Under the
+    # ParallelConfig TPA-DCP invariant (TPA * DCP = TP), this is
+    # equivalent to `tp_rank // (full_tp_size // attn_tp_size)`.
     full_tp_size = tensor_model_parallel_size
     full_tp_rank = _TP.rank_in_group
     attn_tp_size = (
@@ -1743,7 +1754,8 @@ def initialize_model_parallel(
             f"tensor_model_parallel_size ({full_tp_size}) must be divisible "
             f"by tensor_parallel_size_attention ({attn_tp_size})"
         )
-    attn_tp_rank = full_tp_rank % attn_tp_size
+    dcp_size_for_attn = full_tp_size // attn_tp_size
+    attn_tp_rank = full_tp_rank // dcp_size_for_attn
     init_layer_parallel_resolver(
         full_tp_size=full_tp_size,
         full_tp_rank=full_tp_rank,
