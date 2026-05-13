@@ -322,10 +322,13 @@ class BatchDCPPrefillWrapper:
         )
         lse_context = lse_context.transpose(0, 1).contiguous()
 
+        # Force contiguous on Q/K/V before the ragged wrapper. FlashInfer's
+        # ragged kernel on SM10.x can produce wrong values with non-canonical
+        # strides on some configurations; FA's varlen is more forgiving.
         output_query, lse_query = self._new_tokens.run(
-            prefill_query,
-            key,
-            value,
+            prefill_query.contiguous(),
+            key.contiguous(),
+            value.contiguous(),
             return_lse=True,
         )
         lse_query = lse_query.transpose(0, 1).contiguous()
