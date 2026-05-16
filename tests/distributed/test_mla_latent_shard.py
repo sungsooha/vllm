@@ -6,6 +6,7 @@ import torch
 
 from vllm.distributed.latent_shard_utils import (
     all_gather_latent_cache,
+    gather_top_k_dsv4_payload,
     sharded_rms_norm,
 )
 
@@ -22,12 +23,19 @@ class _FakeLatentGroup:
         self,
         *,
         world_size: int,
+        rank_in_group: int = 0,
         all_reduce_result: torch.Tensor | None = None,
-        all_gather_result: torch.Tensor | None = None,
+        all_gather_result: torch.Tensor | list[torch.Tensor] | None = None,
     ) -> None:
         self.world_size = world_size
+        self.rank_in_group = rank_in_group
         self._all_reduce_result = all_reduce_result
-        self._all_gather_result = all_gather_result
+        if isinstance(all_gather_result, list):
+            self._all_gather_results = list(all_gather_result)
+        elif all_gather_result is None:
+            self._all_gather_results = []
+        else:
+            self._all_gather_results = [all_gather_result]
 
     def all_reduce(self, tensor: torch.Tensor) -> torch.Tensor:
         assert self._all_reduce_result is not None
@@ -35,10 +43,10 @@ class _FakeLatentGroup:
         return self._all_reduce_result.clone()
 
     def all_gather(self, tensor: torch.Tensor, dim: int = -1) -> torch.Tensor:
-        assert dim == -1
-        assert self._all_gather_result is not None
-        assert tensor.shape[:-1] == self._all_gather_result.shape[:-1]
-        return self._all_gather_result.clone()
+        assert self._all_gather_results
+        result = self._all_gather_results.pop(0)
+        assert tensor.shape[:dim] == result.shape[:dim]
+        return result.clone()
 
 
 def _rms_norm_ref(
@@ -172,3 +180,64 @@ def test_mla_latent_shard_step5_matches_unsharded_projection_path() -> None:
         atol=1e-6,
         rtol=1e-6,
     )
+
+
+def test_gather_top_k_dsv4_payload_reconstructs_full_payload() -> None:
+    num_tokens = 8
+    batch = 2
+    topk = 3
+    world_size = 2
+
+    full_nope = (
+        torch.arange(num_tokens * 7 * 64, dtype=torch.int64).reshape(num_tokens, 7, 64)
+        % 251
+    ).to(torch.uint8)
+    full_scales = (
+        torch.arange(num_tokens * 7, dtype=torch.int64).reshape(num_tokens, 7) + 17
+    ).to(torch.uint8)
+    rope = (
+        torch.arange(num_tokens * 128, dtype=torch.int64).reshape(num_tokens, 128) + 31
+    ).to(torch.uint8)
+    topk_indices = torch.tensor([[7, 0, 3], [2, 5, 1]], dtype=torch.long)
+
+    rank0_nope = full_nope[:, :4, :]
+    rank0_scales = full_scales[:, :4]
+    rank1_nope = full_nope[:, 4:, :]
+    rank1_scales = full_scales[:, 4:]
+
+    selected_rank0_nope = rank0_nope[topk_indices]
+    selected_rank0_scales = rank0_scales[topk_indices]
+    selected_rank1_nope = rank1_nope[topk_indices]
+    selected_rank1_scales = rank1_scales[topk_indices]
+
+    padded_rank1_nope = torch.zeros(
+        *selected_rank1_nope.shape[:-2], 4, 64, dtype=torch.uint8
+    )
+    padded_rank1_nope[..., :3, :] = selected_rank1_nope
+    gathered_nope = torch.cat([selected_rank0_nope, padded_rank1_nope], dim=-2)
+
+    padded_rank1_scales = torch.zeros(
+        *selected_rank1_scales.shape[:-1], 4, dtype=torch.uint8
+    )
+    padded_rank1_scales[..., :3] = selected_rank1_scales
+    gathered_scales = torch.cat([selected_rank0_scales, padded_rank1_scales], dim=-1)
+
+    payload = gather_top_k_dsv4_payload(
+        rank0_nope,
+        rank0_scales,
+        rope,
+        topk_indices,
+        _FakeLatentGroup(
+            world_size=world_size,
+            rank_in_group=0,
+            all_gather_result=[gathered_nope, gathered_scales],
+        ),
+    )
+
+    expected = torch.empty(batch, topk, 584, dtype=torch.uint8)
+    expected[..., :448] = full_nope[topk_indices].reshape(batch, topk, 448)
+    expected[..., 448:576] = rope[topk_indices]
+    expected[..., 576:583] = full_scales[topk_indices]
+    expected[..., 583] = 0
+
+    torch.testing.assert_close(payload, expected, atol=0, rtol=0)
