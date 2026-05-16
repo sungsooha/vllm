@@ -1272,7 +1272,11 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
 
         # Use pre-computed prefill metadata.
         seq_lens = swa_metadata.prefill_seq_lens
-        swa_seq_lens = swa_metadata.prefill_swa_seq_lens
+        swa_seq_lens = getattr(swa_metadata, "prefill_swa_seq_lens", None)
+        if swa_seq_lens is None:
+            # Older DSv4 metadata only exposes the effective SWA prefill lengths
+            # as prefill_seq_lens. DCP-aware metadata names this explicitly.
+            swa_seq_lens = seq_lens
         swa_gather_lens = swa_metadata.prefill_gather_lens
         assert seq_lens is not None
         assert swa_seq_lens is not None
