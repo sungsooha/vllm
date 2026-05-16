@@ -1241,6 +1241,14 @@ def get_dcp_group() -> GroupCoordinator:
     return _DCP
 
 
+_LATENT_PARALLEL: GroupCoordinator | None = None
+
+
+def get_latent_parallel_group() -> GroupCoordinator:
+    assert _LATENT_PARALLEL is not None, "KV latent parallel group is not initialized"
+    return _LATENT_PARALLEL
+
+
 # kept for backward compatibility
 get_context_model_parallel_group = get_dcp_group
 
@@ -1532,6 +1540,16 @@ def initialize_model_parallel(
     data_parallel_size = config.parallel_config.data_parallel_size
     enable_elastic_ep = config.parallel_config.enable_elastic_ep
     parallel_config = config.parallel_config
+    kv_latent_parallel_size = getattr(parallel_config, "kv_latent_parallel_size", 1)
+    if kv_latent_parallel_size < 1:
+        raise ValueError(
+            f"kv_latent_parallel_size must be >= 1, got {kv_latent_parallel_size}"
+        )
+    if tensor_model_parallel_size % kv_latent_parallel_size != 0:
+        raise ValueError(
+            "kv_latent_parallel_size must divide tensor_model_parallel_size, got "
+            f"{kv_latent_parallel_size=} and {tensor_model_parallel_size=}"
+        )
     coord_store: Store | None = None
     if enable_elastic_ep:
         coord_store = get_cached_tcp_store_client(
@@ -1613,6 +1631,37 @@ def initialize_model_parallel(
         backend,
         use_message_queue_broadcaster=True,
         group_name="dcp",
+    )
+
+    # Build the KV-latent model-parallel groups.
+    #
+    # Latent parallelism is an orthogonal subdivision inside each TP group.
+    # We interpret the TP axis as [head_parallel, latent_parallel] so ranks
+    # with the same head-parallel coordinate and adjacent latent coordinates
+    # form one latent group. Example: TP=4, kv_latent_parallel_size=2 yields
+    # latent groups [0, 1] and [2, 3] inside each TP group.
+    global _LATENT_PARALLEL
+    assert _LATENT_PARALLEL is None, "KV latent parallel group is already initialized"
+    head_parallel_size = tensor_model_parallel_size // kv_latent_parallel_size
+    group_ranks = (
+        all_ranks.reshape(-1, head_parallel_size, kv_latent_parallel_size)
+        .reshape(-1, kv_latent_parallel_size)
+        .unbind(0)
+    )
+    group_ranks = [x.tolist() for x in group_ranks]
+    if enable_elastic_ep:
+        group_ranks = (
+            local_all_ranks.reshape(-1, head_parallel_size, kv_latent_parallel_size)
+            .reshape(-1, kv_latent_parallel_size)
+            .unbind(0)
+        )
+        group_ranks = [x.tolist() for x in group_ranks]
+    _LATENT_PARALLEL = init_model_parallel_group(
+        group_ranks,
+        get_world_group().local_rank,
+        backend,
+        use_message_queue_broadcaster=True,
+        group_name="kv_latent",
     )
 
     global _PCP
@@ -1725,13 +1774,16 @@ def initialize_model_parallel(
     logger.info_once(
         "rank %s in world size %s is assigned as "
         "DP rank %s, PP rank %s, PCP rank %s, "
-        "TP rank %s, EP rank %s, EPLB rank %s",
+        "TP rank %s, DCP rank %s, KV latent rank %s, "
+        "EP rank %s, EPLB rank %s",
         rank,
         world_size,
         _DP.rank_in_group,
         _PP.rank_in_group,
         _PCP.rank_in_group,
         _TP.rank_in_group,
+        _DCP.rank_in_group,
+        _LATENT_PARALLEL.rank_in_group,
         _EP.rank_in_group if _EP is not None else "N/A",
         _EPLB.rank_in_group if _EPLB is not None else "N/A",
     )
@@ -1791,6 +1843,8 @@ def prepare_communication_buffer_for_model(model: torch.nn.Module):
     """
     if _TP is not None:
         _TP.prepare_communication_buffer_for_model(model)
+    if _LATENT_PARALLEL is not None:
+        _LATENT_PARALLEL.prepare_communication_buffer_for_model(model)
     if _PCP is not None:
         _PCP.prepare_communication_buffer_for_model(model)
     if _PP is not None:
@@ -1805,7 +1859,7 @@ def prepare_communication_buffer_for_model(model: torch.nn.Module):
 
 def model_parallel_is_initialized():
     """Check if tensor and pipeline parallel groups are initialized."""
-    return _TP is not None and _PP is not None
+    return _TP is not None and _LATENT_PARALLEL is not None and _PP is not None
 
 
 _TP_STATE_PATCHED = False
@@ -1856,6 +1910,16 @@ def get_decode_context_model_parallel_rank() -> int:
     return get_dcp_group().rank_in_group
 
 
+def get_latent_parallel_world_size() -> int:
+    """Return world size for the KV latent parallel group."""
+    return get_latent_parallel_group().world_size
+
+
+def get_latent_parallel_rank() -> int:
+    """Return my rank for the KV latent parallel group."""
+    return get_latent_parallel_group().rank_in_group
+
+
 def get_node_count() -> int:
     """Return the total number of nodes in the distributed environment."""
     assert _NODE_COUNT is not None, "distributed environment is not initialized"
@@ -1874,6 +1938,11 @@ def destroy_model_parallel():
     if _DCP:
         _DCP.destroy()
     _DCP = None
+
+    global _LATENT_PARALLEL
+    if _LATENT_PARALLEL:
+        _LATENT_PARALLEL.destroy()
+    _LATENT_PARALLEL = None
 
     global _PCP
     if _PCP:
