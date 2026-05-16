@@ -260,6 +260,7 @@ def test_dsv4_payload_pack_roundtrips_page_tail_scale_layout() -> None:
         block_size,
     )
     assert paged_cache.shape == (3, block_size, 584)
+    assert paged_cache.stride(0) % 576 == 0
     torch.testing.assert_close(
         dense_indices,
         torch.arange(batch * topk, dtype=torch.int32).reshape(batch, topk),

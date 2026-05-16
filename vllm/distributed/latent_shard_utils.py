@@ -11,6 +11,11 @@ _DSV4_ROPE_BYTES = 128
 _DSV4_SCALE_BYTES = 8
 _DSV4_TOKEN_DATA_BYTES = _DSV4_NOPE_BLOCKS * _DSV4_NOPE_BLOCK_BYTES + _DSV4_ROPE_BYTES
 _DSV4_PAYLOAD_BYTES = _DSV4_TOKEN_DATA_BYTES + _DSV4_SCALE_BYTES
+_DSV4_TMA_K_STRIDE = _DSV4_TOKEN_DATA_BYTES
+
+
+def _round_up(value: int, alignment: int) -> int:
+    return ((value + alignment - 1) // alignment) * alignment
 
 
 def sharded_rms_norm(
@@ -315,8 +320,11 @@ def pack_dsv4_payload_to_paged_cache(
     ``compact_payload`` is shaped ``[..., 584]`` as
     ``[448 NoPE | 128 RoPE | 7 scales + pad]``. FlashMLA's cache page stores
     the first 576 bytes for every token contiguously at the front of the page
-    and the 8 scale bytes for every token in a page-tail region. The returned
-    dense indices point to the packed token slots in row-major order.
+    and the 8 scale bytes for every token in a page-tail region. Blackwell's
+    FlashMLA SM100 path also requires the page stride to be aligned to
+    ``TMA_K_STRIDE == 576`` bytes, matching the production KV-cache allocator's
+    padded-page ``as_strided`` layout. The returned dense indices point to the
+    packed token slots in row-major order.
     """
     if compact_payload.dtype is not torch.uint8:
         raise ValueError("compact_payload must be torch.uint8.")
@@ -331,10 +339,13 @@ def pack_dsv4_payload_to_paged_cache(
     payload_shape = compact_payload.shape[:-1]
     num_tokens = compact_payload.numel() // _DSV4_PAYLOAD_BYTES
     num_blocks = (num_tokens + block_size - 1) // block_size
-    paged_cache = compact_payload.new_zeros(
-        num_blocks,
-        block_size,
-        _DSV4_PAYLOAD_BYTES,
+    real_page_size = block_size * _DSV4_PAYLOAD_BYTES
+    padded_page_size = _round_up(real_page_size, _DSV4_TMA_K_STRIDE)
+    raw_cache = compact_payload.new_zeros(num_blocks * padded_page_size)
+    paged_cache = torch.as_strided(
+        raw_cache,
+        size=(num_blocks, block_size, _DSV4_PAYLOAD_BYTES),
+        stride=(padded_page_size, _DSV4_PAYLOAD_BYTES, 1),
     )
     if num_tokens == 0:
         dense_indices = torch.empty(
