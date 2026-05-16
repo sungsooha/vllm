@@ -168,7 +168,6 @@ class DeepseekV4MLAModules:
     fused_wqa_wkv: torch.nn.Module
     q_norm: torch.nn.Module
     wq_b: torch.nn.Module
-    wq_b_dcp: torch.nn.Module | None
     kv_norm: torch.nn.Module
     wo_a: torch.nn.Module
     wo_b: torch.nn.Module
@@ -177,6 +176,7 @@ class DeepseekV4MLAModules:
     indexer: torch.nn.Module | None
     indexer_rotary_emb: torch.nn.Module
     topk_indices_buffer: torch.Tensor | None
+    wq_b_dcp: torch.nn.Module | None = None
     aux_stream_list: list[torch.cuda.Stream] | None = None
 
 
