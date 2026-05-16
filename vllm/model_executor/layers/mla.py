@@ -5,7 +5,10 @@ from dataclasses import dataclass
 import torch
 
 from vllm.config import CacheConfig
-from vllm.distributed.latent_shard_utils import sharded_rms_norm
+from vllm.distributed.latent_shard_utils import (
+    all_gather_latent_cache,
+    sharded_rms_norm,
+)
 from vllm.distributed.parallel_state import (
     get_latent_parallel_group,
     get_latent_parallel_rank,
@@ -204,6 +207,13 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         assert kv_c is not None
         assert k_pe is not None
         kv_c_normed = self._apply_kv_a_layernorm(kv_c)
+        if self.kv_latent_parallel_size > 1:
+            # Phase A P1: restore the full latent vector before the backend
+            # updates cache or plans attention. Step 6 moves this gather to
+            # the read side after the cache stores only local latent shards.
+            kv_c_normed = all_gather_latent_cache(
+                kv_c_normed, self.kv_latent_parallel_group
+            )
 
         q = q.view(-1, self.num_heads, self.qk_head_dim)
         # Add head dim of 1 to k_pe
