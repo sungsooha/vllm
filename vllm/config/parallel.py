@@ -112,6 +112,8 @@ class ParallelConfig:
     """Number of pipeline parallel groups."""
     tensor_parallel_size: int = 1
     """Number of tensor parallel groups."""
+    kv_latent_parallel_size: int = 1
+    """Number of KV latent parallel ranks inside each tensor parallel group."""
     prefill_context_parallel_size: int = 1
     """Number of prefill context parallel groups."""
     data_parallel_size: int = 1
@@ -473,6 +475,28 @@ class ParallelConfig:
             raise ValueError(
                 f"tp_size={self.tensor_parallel_size} must be divisible by"
                 f"dcp_size={self.decode_context_parallel_size}."
+            )
+
+        allowed_kv_latent_sizes = (1, 2, 4, 8)
+        if self.kv_latent_parallel_size not in allowed_kv_latent_sizes:
+            raise ValueError(
+                "kv_latent_parallel_size must be one of "
+                f"{allowed_kv_latent_sizes}, got {self.kv_latent_parallel_size}."
+            )
+
+        if self.kv_latent_parallel_size > self.tensor_parallel_size:
+            raise ValueError(
+                "kv_latent_parallel_size must be <= tensor_parallel_size, got "
+                f"kv_latent_parallel_size={self.kv_latent_parallel_size} and "
+                f"tensor_parallel_size={self.tensor_parallel_size}."
+            )
+
+        if self.tensor_parallel_size % self.kv_latent_parallel_size != 0:
+            raise ValueError(
+                "tensor_parallel_size must be divisible by "
+                "kv_latent_parallel_size, got "
+                f"tensor_parallel_size={self.tensor_parallel_size} and "
+                f"kv_latent_parallel_size={self.kv_latent_parallel_size}."
             )
 
         if self.dcp_comm_backend == "a2a" and self.decode_context_parallel_size <= 1:
