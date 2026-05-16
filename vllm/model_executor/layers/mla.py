@@ -181,9 +181,6 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             q_c = self.q_a_layernorm(q_c)
             q = self.q_b_proj(q_c)[0]
         else:
-            assert self.kv_a_proj_with_mqa is not None, (
-                "kv_a_proj_with_mqa is required when q_lora_rank is None"
-            )
             assert self.q_proj is not None, (
                 "q_proj is required when q_lora_rank is None"
             )
@@ -197,6 +194,9 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
                 kv_c = self.kv_a_proj_latent(hidden_states)[0]
                 k_pe = self.kv_a_proj_rope(hidden_states)[0]
             else:
+                assert self.kv_a_proj_with_mqa is not None, (
+                    "kv_a_proj_with_mqa is required when q_lora_rank is None"
+                )
                 kv_lora = self.kv_a_proj_with_mqa(hidden_states)[0]
             q = self.q_proj(hidden_states)[0]
 
