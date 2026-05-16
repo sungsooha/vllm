@@ -6,7 +6,10 @@ import torch
 
 from vllm.distributed.latent_shard_utils import (
     all_gather_latent_cache,
+    dsv4_paged_cache_to_latent_components,
     gather_top_k_dsv4_payload,
+    gather_top_k_dsv4_payload_from_paged_cache,
+    pack_dsv4_payload_to_paged_cache,
     sharded_rms_norm,
 )
 
@@ -240,4 +243,97 @@ def test_gather_top_k_dsv4_payload_reconstructs_full_payload() -> None:
     expected[..., 576:583] = full_scales[topk_indices]
     expected[..., 583] = 0
 
+    torch.testing.assert_close(payload, expected, atol=0, rtol=0)
+
+
+def test_dsv4_payload_pack_roundtrips_page_tail_scale_layout() -> None:
+    batch = 2
+    topk = 5
+    block_size = 4
+    compact = (
+        torch.arange(batch * topk * 584, dtype=torch.int64).reshape(batch, topk, 584)
+        % 251
+    ).to(torch.uint8)
+
+    paged_cache, dense_indices = pack_dsv4_payload_to_paged_cache(
+        compact,
+        block_size,
+    )
+    assert paged_cache.shape == (3, block_size, 584)
+    torch.testing.assert_close(
+        dense_indices,
+        torch.arange(batch * topk, dtype=torch.int32).reshape(batch, topk),
+    )
+
+    token_data, scales, rope = dsv4_paged_cache_to_latent_components(
+        paged_cache,
+        _FakeLatentGroup(world_size=1, rank_in_group=0),
+    )
+    topk_indices = dense_indices.to(torch.long)
+    gathered = gather_top_k_dsv4_payload(
+        token_data,
+        scales,
+        rope,
+        topk_indices,
+        _FakeLatentGroup(
+            world_size=1,
+            rank_in_group=0,
+            all_gather_result=[
+                token_data[topk_indices],
+                scales[topk_indices],
+            ],
+        ),
+    )
+    torch.testing.assert_close(gathered, compact, atol=0, rtol=0)
+
+
+def test_gather_top_k_dsv4_payload_from_paged_cache_handles_uneven_shards() -> None:
+    num_tokens = 9
+    block_size = 4
+    world_size = 2
+    topk_indices = torch.tensor([[8, 3, -1], [2, 6, 0]], dtype=torch.long)
+
+    compact = (
+        torch.arange(num_tokens * 584, dtype=torch.int64).reshape(num_tokens, 584) % 251
+    ).to(torch.uint8)
+    paged_cache, _ = pack_dsv4_payload_to_paged_cache(compact, block_size)
+
+    rank0_nope, rank0_scales, _ = dsv4_paged_cache_to_latent_components(
+        paged_cache,
+        _FakeLatentGroup(world_size=world_size, rank_in_group=0),
+    )
+    rank1_nope, rank1_scales, _ = dsv4_paged_cache_to_latent_components(
+        paged_cache,
+        _FakeLatentGroup(world_size=world_size, rank_in_group=1),
+    )
+
+    safe_indices = topk_indices.clamp_min(0)
+    selected_rank0_nope = rank0_nope[safe_indices]
+    selected_rank0_scales = rank0_scales[safe_indices]
+    selected_rank1_nope = rank1_nope[safe_indices]
+    selected_rank1_scales = rank1_scales[safe_indices]
+
+    padded_rank1_nope = torch.zeros(
+        *selected_rank1_nope.shape[:-2], 4, 64, dtype=torch.uint8
+    )
+    padded_rank1_nope[..., :3, :] = selected_rank1_nope
+    gathered_nope = torch.cat([selected_rank0_nope, padded_rank1_nope], dim=-2)
+
+    padded_rank1_scales = torch.zeros(
+        *selected_rank1_scales.shape[:-1], 4, dtype=torch.uint8
+    )
+    padded_rank1_scales[..., :3] = selected_rank1_scales
+    gathered_scales = torch.cat([selected_rank0_scales, padded_rank1_scales], dim=-1)
+
+    payload = gather_top_k_dsv4_payload_from_paged_cache(
+        paged_cache,
+        topk_indices,
+        _FakeLatentGroup(
+            world_size=world_size,
+            rank_in_group=0,
+            all_gather_result=[gathered_nope, gathered_scales],
+        ),
+    )
+
+    expected = compact[safe_indices]
     torch.testing.assert_close(payload, expected, atol=0, rtol=0)

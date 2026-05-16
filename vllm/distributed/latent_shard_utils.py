@@ -73,6 +73,85 @@ def _dsv4_nope_block_partition(
     return start, start + count
 
 
+def dsv4_nope_block_partition(rank: int, world_size: int) -> tuple[int, int]:
+    """Return the DSv4 NoPE quant-block range owned by one latent rank."""
+    return _dsv4_nope_block_partition(rank, world_size)
+
+
+def _validate_dsv4_paged_cache(k_cache: torch.Tensor) -> torch.Tensor:
+    if k_cache.dtype is not torch.uint8:
+        raise ValueError("DSv4 fp8_ds_mla paged cache must be torch.uint8.")
+    if k_cache.dim() == 4:
+        if k_cache.shape[-2] != 1:
+            raise ValueError(
+                "4D DSv4 fp8_ds_mla cache must have singleton KV-head dim."
+            )
+        k_cache = k_cache.squeeze(-2)
+    if k_cache.dim() != 3:
+        raise ValueError(
+            "DSv4 fp8_ds_mla paged cache must have shape [num_blocks, block_size, 584]."
+        )
+    if k_cache.shape[-1] != _DSV4_PAYLOAD_BYTES:
+        raise ValueError(
+            f"DSv4 fp8_ds_mla paged cache must have {_DSV4_PAYLOAD_BYTES} "
+            f"bytes/token, got {k_cache.shape[-1]}."
+        )
+    return k_cache
+
+
+def _dsv4_paged_cache_token_and_scale_views(
+    k_cache: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return semantic token-data and page-tail-scale views of a DSv4 page."""
+    k_cache = _validate_dsv4_paged_cache(k_cache)
+    num_blocks, block_size, _ = k_cache.shape
+    flat_cache = k_cache.view(num_blocks, -1)
+    token_data = flat_cache[:, : block_size * _DSV4_TOKEN_DATA_BYTES].view(
+        num_blocks,
+        block_size,
+        _DSV4_TOKEN_DATA_BYTES,
+    )
+    scales = flat_cache[
+        :,
+        block_size * _DSV4_TOKEN_DATA_BYTES : block_size
+        * (_DSV4_TOKEN_DATA_BYTES + _DSV4_SCALE_BYTES),
+    ].view(num_blocks, block_size, _DSV4_SCALE_BYTES)
+    return token_data, scales
+
+
+def dsv4_paged_cache_to_latent_components(
+    k_cache: torch.Tensor,
+    group: GroupCoordinator,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Unpack a full DSv4 paged cache into this rank's latent components.
+
+    This helper is intentionally a B5-2 staging bridge: the cache is still
+    full-width per rank, so we unpack it into token-major component tensors,
+    then slice the logical latent block partition for the caller rank. B5-3
+    replaces this with direct reads from rank-local striped cache storage.
+    """
+    token_data, scales = _dsv4_paged_cache_token_and_scale_views(k_cache)
+    num_blocks, block_size, _ = token_data.shape
+    num_tokens = num_blocks * block_size
+    token_data = token_data.reshape(num_tokens, _DSV4_TOKEN_DATA_BYTES)
+    scales = scales.reshape(num_tokens, _DSV4_SCALE_BYTES)
+
+    start_block, end_block = _dsv4_nope_block_partition(
+        group.rank_in_group,
+        group.world_size,
+    )
+    full_nope_blocks = token_data[
+        :, : _DSV4_NOPE_BLOCKS * _DSV4_NOPE_BLOCK_BYTES
+    ].reshape(num_tokens, _DSV4_NOPE_BLOCKS, _DSV4_NOPE_BLOCK_BYTES)
+    local_nope_blocks = full_nope_blocks[:, start_block:end_block, :].contiguous()
+    local_scales = scales[:, start_block:end_block].contiguous()
+    rope = token_data[
+        :,
+        _DSV4_NOPE_BLOCKS * _DSV4_NOPE_BLOCK_BYTES : _DSV4_TOKEN_DATA_BYTES,
+    ].contiguous()
+    return local_nope_blocks, local_scales, rope
+
+
 def gather_top_k_dsv4_payload(
     cache_local_nope_blocks: torch.Tensor,
     cache_local_scales: torch.Tensor,
@@ -144,9 +223,12 @@ def gather_top_k_dsv4_payload(
         device=cache_local_nope_blocks.device,
         dtype=torch.long,
     )
-    selected_nope = cache_local_nope_blocks[topk_indices]
-    selected_scales = cache_local_scales[topk_indices]
-    selected_rope = cache_rope[topk_indices]
+    # FlashMLA uses topk_length to cap valid entries. Padding slots may carry
+    # -1; clamp them to an arbitrary valid row so Python indexing does not wrap.
+    safe_topk_indices = topk_indices.clamp_min(0)
+    selected_nope = cache_local_nope_blocks[safe_topk_indices]
+    selected_scales = cache_local_scales[safe_topk_indices]
+    selected_rope = cache_rope[safe_topk_indices]
 
     max_blocks_per_rank = (_DSV4_NOPE_BLOCKS + world_size - 1) // world_size
     if local_blocks < max_blocks_per_rank:
@@ -198,3 +280,89 @@ def gather_top_k_dsv4_payload(
     ] = full_scales
     payload[..., _DSV4_TOKEN_DATA_BYTES + _DSV4_NOPE_BLOCKS] = 0
     return payload
+
+
+def gather_top_k_dsv4_payload_from_paged_cache(
+    k_cache: torch.Tensor,
+    topk_indices: torch.Tensor,
+    group: GroupCoordinator,
+) -> torch.Tensor:
+    """Gather DSv4 selected payloads from a full-width paged cache.
+
+    B5-2 keeps cache storage unchanged and uses this bridge to exercise the
+    latent gather path. B5-3 should swap the full-cache unpack for direct
+    rank-local stripe reads before calling ``gather_top_k_dsv4_payload``.
+    """
+    local_nope_blocks, local_scales, rope = dsv4_paged_cache_to_latent_components(
+        k_cache,
+        group,
+    )
+    return gather_top_k_dsv4_payload(
+        local_nope_blocks,
+        local_scales,
+        rope,
+        topk_indices,
+        group,
+    )
+
+
+def pack_dsv4_payload_to_paged_cache(
+    compact_payload: torch.Tensor,
+    block_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pack compact DSv4 payloads into FlashMLA page-tail-scale layout.
+
+    ``compact_payload`` is shaped ``[..., 584]`` as
+    ``[448 NoPE | 128 RoPE | 7 scales + pad]``. FlashMLA's cache page stores
+    the first 576 bytes for every token contiguously at the front of the page
+    and the 8 scale bytes for every token in a page-tail region. The returned
+    dense indices point to the packed token slots in row-major order.
+    """
+    if compact_payload.dtype is not torch.uint8:
+        raise ValueError("compact_payload must be torch.uint8.")
+    if compact_payload.shape[-1] != _DSV4_PAYLOAD_BYTES:
+        raise ValueError(
+            f"compact_payload must have {_DSV4_PAYLOAD_BYTES} bytes/token, got "
+            f"{compact_payload.shape[-1]}."
+        )
+    if block_size <= 0:
+        raise ValueError(f"block_size must be positive, got {block_size}.")
+
+    payload_shape = compact_payload.shape[:-1]
+    num_tokens = compact_payload.numel() // _DSV4_PAYLOAD_BYTES
+    num_blocks = (num_tokens + block_size - 1) // block_size
+    paged_cache = compact_payload.new_zeros(
+        num_blocks,
+        block_size,
+        _DSV4_PAYLOAD_BYTES,
+    )
+    if num_tokens == 0:
+        dense_indices = torch.empty(
+            payload_shape,
+            dtype=torch.int32,
+            device=compact_payload.device,
+        )
+        return paged_cache, dense_indices
+
+    flat_payload = compact_payload.reshape(num_tokens, _DSV4_PAYLOAD_BYTES)
+    slot_ids = torch.arange(num_tokens, device=compact_payload.device)
+    block_ids = slot_ids // block_size
+    pos_ids = slot_ids % block_size
+
+    flat_cache = paged_cache.view(num_blocks, -1)
+    token_data = flat_cache[:, : block_size * _DSV4_TOKEN_DATA_BYTES].view(
+        num_blocks,
+        block_size,
+        _DSV4_TOKEN_DATA_BYTES,
+    )
+    scale_data = flat_cache[
+        :,
+        block_size * _DSV4_TOKEN_DATA_BYTES : block_size
+        * (_DSV4_TOKEN_DATA_BYTES + _DSV4_SCALE_BYTES),
+    ].view(num_blocks, block_size, _DSV4_SCALE_BYTES)
+
+    token_data[block_ids, pos_ids] = flat_payload[:, :_DSV4_TOKEN_DATA_BYTES]
+    scale_data[block_ids, pos_ids] = flat_payload[:, _DSV4_TOKEN_DATA_BYTES:]
+
+    dense_indices = slot_ids.reshape(payload_shape).to(torch.int32)
+    return paged_cache, dense_indices

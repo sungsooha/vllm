@@ -45,6 +45,14 @@ from vllm.distributed import (
     get_pcp_group,
     get_tensor_model_parallel_world_size,
 )
+from vllm.distributed.latent_shard_utils import (
+    gather_top_k_dsv4_payload_from_paged_cache,
+    pack_dsv4_payload_to_paged_cache,
+)
+from vllm.distributed.parallel_state import (
+    get_latent_parallel_group,
+    get_latent_parallel_world_size,
+)
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import PluggableLayer
@@ -834,6 +842,8 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         self.cp_kv_cache_interleave_size = (
             vllm_config.parallel_config.cp_kv_cache_interleave_size
         )
+        self.kv_latent_parallel_group = get_latent_parallel_group()
+        self.kv_latent_parallel_size = get_latent_parallel_world_size()
         self.dcp_combine = (
             dcp_a2a_lse_reduce
             if vllm_config.parallel_config.dcp_comm_backend == "a2a"
@@ -1135,6 +1145,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         # Prepare SWA cache (num_blocks, swa_block_size, 1, head_bytes)
         # Use unsqueeze to preserve strides (handles padded blocks correctly)
         swa_cache = self.swa_cache_layer.kv_cache.unsqueeze(-2)
+        compressed_k_cache = kv_cache
         # Reshape KV cache to (num_blocks, block_size, 1, head_bytes)
         if kv_cache is not None:
             kv_cache = kv_cache.unsqueeze(-2)
@@ -1187,6 +1198,23 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 a2a_send_buffer = decode_workspaces[1]
                 a2a_recv_buffer = decode_workspaces[2]
 
+        extra_k_cache = kv_cache if not swa_only else None
+        extra_indices_in_kvcache = topk_indices
+        if self.kv_latent_parallel_size > 1 and not swa_only:
+            assert compressed_k_cache is not None
+            assert topk_indices is not None
+            compact_topk_payload = gather_top_k_dsv4_payload_from_paged_cache(
+                compressed_k_cache,
+                topk_indices,
+                self.kv_latent_parallel_group,
+            )
+            temp_k_cache, dense_topk_indices = pack_dsv4_payload_to_paged_cache(
+                compact_topk_payload,
+                block_size=compressed_k_cache.shape[1],
+            )
+            extra_k_cache = temp_k_cache.unsqueeze(-2)
+            extra_indices_in_kvcache = dense_topk_indices
+
         out, lse = flash_mla_with_kvcache(
             q=q_flash,
             k_cache=swa_cache,
@@ -1199,8 +1227,8 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             topk_length=swa_lens,
             softmax_scale=self.scale,
             attn_sink=None if self.dcp_world_size > 1 else self.attn_sink,
-            extra_k_cache=kv_cache if not swa_only else None,
-            extra_indices_in_kvcache=topk_indices,
+            extra_k_cache=extra_k_cache,
+            extra_indices_in_kvcache=extra_indices_in_kvcache,
             extra_topk_length=topk_lens,
             out=flash_output.unsqueeze(1),
         )
