@@ -156,6 +156,8 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
     ) -> torch.Tensor:
         q_c = None
         kv_lora = None
+        kv_c = None
+        k_pe = None
 
         if self.q_lora_rank is not None:
             assert self.fused_qkv_a_proj is not None, (
@@ -199,6 +201,8 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             kv_c, k_pe = kv_lora.split(
                 [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
             )
+        assert kv_c is not None
+        assert k_pe is not None
         kv_c_normed = self._apply_kv_a_layernorm(kv_c)
 
         q = q.view(-1, self.num_heads, self.qk_head_dim)

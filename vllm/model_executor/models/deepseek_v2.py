@@ -907,6 +907,12 @@ class DeepseekV2MLAAttention(nn.Module):
         self.kv_a_proj_latent = None
         self.kv_a_proj_rope = None
         if self.q_lora_rank is not None:
+            if self.kv_latent_parallel_size > 1:
+                raise NotImplementedError(
+                    "kv_latent_parallel_size > 1 is currently supported only "
+                    "when q_lora_rank is None. Fused QKV-A latent sharding "
+                    "requires the Phase B DSv4 path."
+                )
             self.fused_qkv_a_proj = DeepSeekV2FusedQkvAProjLinear(
                 proj_input_size,
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
