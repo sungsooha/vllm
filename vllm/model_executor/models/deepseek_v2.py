@@ -888,6 +888,9 @@ class DeepseekV2MLAAttention(nn.Module):
 
         self.q_lora_rank = q_lora_rank
         self.kv_lora_rank = kv_lora_rank
+        self.kv_latent_parallel_size = (
+            vllm_config.parallel_config.kv_latent_parallel_size
+        )
 
         self.num_heads = num_heads
         tp_size = get_tensor_model_parallel_world_size()
@@ -901,6 +904,8 @@ class DeepseekV2MLAAttention(nn.Module):
         # otherwise default to hidden_size (used in Eagle3 Deepseek with MLA)
         proj_input_size = input_size if input_size is not None else self.hidden_size
 
+        self.kv_a_proj_latent = None
+        self.kv_a_proj_rope = None
         if self.q_lora_rank is not None:
             self.fused_qkv_a_proj = DeepSeekV2FusedQkvAProjLinear(
                 proj_input_size,
@@ -908,6 +913,25 @@ class DeepseekV2MLAAttention(nn.Module):
                 quant_config=quant_config,
                 prefix=f"{prefix}.fused_qkv_a_proj",
             )
+        elif self.kv_latent_parallel_size > 1:
+            # V1 keeps this projection replicated and slices the local latent
+            # shard after projection. The weight is tiny relative to the model,
+            # and this avoids a custom process-group-aware linear layer.
+            self.kv_a_proj_latent = ReplicatedLinear(
+                proj_input_size,
+                self.kv_lora_rank,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.kv_a_proj_latent",
+            )
+            self.kv_a_proj_rope = ReplicatedLinear(
+                proj_input_size,
+                self.qk_rope_head_dim,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.kv_a_proj_rope",
+            )
+            self.kv_a_proj_with_mqa = None
         else:
             self.kv_a_proj_with_mqa = ReplicatedLinear(
                 proj_input_size,
@@ -1014,6 +1038,8 @@ class DeepseekV2MLAAttention(nn.Module):
             indexer_rotary_emb=self.indexer_rope_emb,
             is_sparse=self.is_v32,
             topk_indices_buffer=topk_indices_buffer,
+            kv_a_proj_latent=self.kv_a_proj_latent,
+            kv_a_proj_rope=self.kv_a_proj_rope,
         )
 
         self.mla_attn = MultiHeadLatentAttentionWrapper(
@@ -1522,6 +1548,23 @@ class DeepseekV2ForCausalLM(
                 name, loaded_weight, _pending_wk_fp8, params_dict, loaded_params
             ):
                 continue
+
+            if name.endswith(".weight") and "kv_a_proj_with_mqa" in name:
+                latent_name = name.replace("kv_a_proj_with_mqa", "kv_a_proj_latent")
+                rope_name = name.replace("kv_a_proj_with_mqa", "kv_a_proj_rope")
+                if latent_name in params_dict and rope_name in params_dict:
+                    # Latent-shard V1 splits the historical packed W_DKV/W_KR
+                    # checkpoint tensor into two replicated projection modules.
+                    latent_param = params_dict[latent_name]
+                    rope_param = params_dict[rope_name]
+                    latent_size = latent_param.shape[0]
+                    rope_size = rope_param.shape[0]
+                    latent_weight = loaded_weight.narrow(0, 0, latent_size)
+                    rope_weight = loaded_weight.narrow(0, latent_size, rope_size)
+                    latent_param.weight_loader(latent_param, latent_weight)
+                    rope_param.weight_loader(rope_param, rope_weight)
+                    loaded_params.update({latent_name, rope_name})
+                    continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 # Skip non-stacked layers and experts (experts handled below).

@@ -5,6 +5,12 @@ from dataclasses import dataclass
 import torch
 
 from vllm.config import CacheConfig
+from vllm.distributed.latent_shard_utils import sharded_rms_norm
+from vllm.distributed.parallel_state import (
+    get_latent_parallel_group,
+    get_latent_parallel_rank,
+    get_latent_parallel_world_size,
+)
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.attention import MLAAttention
 from vllm.model_executor.layers.quantization import QuantizationConfig
@@ -27,6 +33,8 @@ class MLAModules:
     is_sparse: bool
     topk_indices_buffer: torch.Tensor | None
     indexer_rotary_emb: torch.nn.Module | None = None
+    kv_a_proj_latent: torch.nn.Module | None = None
+    kv_a_proj_rope: torch.nn.Module | None = None
 
 
 # --8<-- [start:multi_head_latent_attention]
@@ -76,6 +84,8 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         self.num_heads = num_heads
         self.fused_qkv_a_proj = mla_modules.fused_qkv_a_proj
         self.kv_a_proj_with_mqa = mla_modules.kv_a_proj_with_mqa
+        self.kv_a_proj_latent = mla_modules.kv_a_proj_latent
+        self.kv_a_proj_rope = mla_modules.kv_a_proj_rope
         self.q_a_layernorm = mla_modules.q_a_layernorm
         self.q_b_proj = mla_modules.q_b_proj
         self.q_proj = mla_modules.q_proj
@@ -86,6 +96,18 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         self.indexer = mla_modules.indexer
         self.indexer_rope_emb = mla_modules.indexer_rotary_emb
         self.is_sparse = mla_modules.is_sparse
+        self.kv_latent_parallel_group = get_latent_parallel_group()
+        self.kv_latent_parallel_size = get_latent_parallel_world_size()
+        self.kv_latent_parallel_rank = get_latent_parallel_rank()
+        if self.kv_lora_rank % self.kv_latent_parallel_size != 0:
+            raise ValueError(
+                "kv_lora_rank must be divisible by kv_latent_parallel_size, got "
+                f"kv_lora_rank={self.kv_lora_rank} and "
+                f"kv_latent_parallel_size={self.kv_latent_parallel_size}."
+            )
+        self.kv_lora_rank_per_partition = (
+            self.kv_lora_rank // self.kv_latent_parallel_size
+        )
 
         if self.indexer is not None:
             assert hasattr(self.indexer, "topk_tokens")
@@ -109,6 +131,22 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         )
 
         self.prefix = prefix
+
+    def _apply_kv_a_layernorm(self, kv_c: torch.Tensor) -> torch.Tensor:
+        if self.kv_latent_parallel_size == 1:
+            return self.kv_a_layernorm(kv_c)
+
+        start = self.kv_latent_parallel_rank * self.kv_lora_rank_per_partition
+        kv_c_local = kv_c.narrow(-1, start, self.kv_lora_rank_per_partition)
+        gamma_local = self.kv_a_layernorm.weight.narrow(
+            0, start, self.kv_lora_rank_per_partition
+        )
+        return sharded_rms_norm(
+            kv_c_local,
+            gamma_local,
+            self.kv_a_layernorm.variance_epsilon,
+            self.kv_latent_parallel_group,
+        )
 
     def forward(
         self,
@@ -144,11 +182,24 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             assert self.q_proj is not None, (
                 "q_proj is required when q_lora_rank is None"
             )
-            kv_lora = self.kv_a_proj_with_mqa(hidden_states)[0]
+            if self.kv_latent_parallel_size > 1:
+                assert self.kv_a_proj_latent is not None, (
+                    "kv_a_proj_latent is required when kv_latent_parallel_size > 1"
+                )
+                assert self.kv_a_proj_rope is not None, (
+                    "kv_a_proj_rope is required when kv_latent_parallel_size > 1"
+                )
+                kv_c = self.kv_a_proj_latent(hidden_states)[0]
+                k_pe = self.kv_a_proj_rope(hidden_states)[0]
+            else:
+                kv_lora = self.kv_a_proj_with_mqa(hidden_states)[0]
             q = self.q_proj(hidden_states)[0]
 
-        kv_c, k_pe = kv_lora.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-        kv_c_normed = self.kv_a_layernorm(kv_c)
+        if kv_lora is not None:
+            kv_c, k_pe = kv_lora.split(
+                [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+            )
+        kv_c_normed = self._apply_kv_a_layernorm(kv_c)
 
         q = q.view(-1, self.num_heads, self.qk_head_dim)
         # Add head dim of 1 to k_pe
