@@ -109,7 +109,10 @@ class DeepseekV4XPUAttention(DeepseekV4Attention):
         kv: torch.Tensor,
         positions: torch.Tensor,
         output: torch.Tensor,
+        q_dcp_replicated: torch.Tensor | None = None,
     ) -> None:
+        if q_dcp_replicated is not None:
+            raise NotImplementedError("DSV4 Q replication is only wired for FlashMLA.")
         assert output.shape == q.shape, (
             f"output buffer shape {output.shape} must match q shape {q.shape}"
         )

@@ -112,6 +112,32 @@ def _dcp_a2a_lse_pack_dim(output_dtype: torch.dtype) -> int:
     raise ValueError(f"Cannot pack fp32 LSE into output dtype {output_dtype}.")
 
 
+def dcp_a2a_packed_workspace_specs(
+    num_tokens: int,
+    padded_global_heads: int,
+    head_dim: int,
+    dcp_world_size: int,
+    output_dtype: torch.dtype,
+) -> list[tuple[tuple[int, ...], torch.dtype]]:
+    """
+    Return workspace specs for DCP A2A packed send/recv staging buffers.
+
+    Callers reserve these alongside other live workspace tensors in one
+    `current_workspace_manager().get_simultaneous(...)` call so CUDA graph
+    capture sees a single stable allocation set.
+    """
+    if dcp_world_size == 1:
+        return []
+    assert padded_global_heads % dcp_world_size == 0, (
+        f"padded_global_heads={padded_global_heads} must be divisible by "
+        f"dcp_world_size={dcp_world_size}"
+    )
+    h_per_rank = padded_global_heads // dcp_world_size
+    lse_pack_dim = _dcp_a2a_lse_pack_dim(output_dtype)
+    shape = (dcp_world_size, num_tokens, h_per_rank, head_dim + lse_pack_dim)
+    return [(shape, output_dtype), (shape, output_dtype)]
+
+
 def _dcp_a2a_send_recv_buffers(
     shape: tuple[int, ...],
     device: torch.device,
@@ -353,8 +379,17 @@ def _dcp_a2a_unpack_combine(
     lse_pack_dim: int,
     return_lse: bool,
     is_lse_base_on_e: bool,
+    actual_num_tokens: int | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    world_size, num_tokens, h_per_rank, _ = recv_buffer.shape
+    world_size, buffer_num_tokens, h_per_rank, _ = recv_buffer.shape
+    num_tokens = (
+        actual_num_tokens if actual_num_tokens is not None else buffer_num_tokens
+    )
+    if num_tokens > buffer_num_tokens:
+        raise ValueError(
+            f"actual_num_tokens={num_tokens} exceeds recv_buffer "
+            f"capacity={buffer_num_tokens}."
+        )
     out = torch.empty(
         (num_tokens, h_per_rank, head_dim),
         device=recv_buffer.device,
@@ -397,6 +432,8 @@ def dcp_a2a_lse_reduce(
     ctx: CPTritonContext | None = None,
     return_lse: bool = False,
     is_lse_base_on_e: bool = True,
+    send_buffer: torch.Tensor | None = None,
+    recv_buffer: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
     Combine partial attention outputs across DCP ranks using All-to-All.
@@ -411,6 +448,10 @@ def dcp_a2a_lse_reduce(
         ctx: CPTritonContext (unused, for signature compatibility)
         return_lse: If True, also return the combined global LSE
         is_lse_base_on_e: If True, LSE is base e; if False, base 2
+        send_buffer: Optional preallocated send staging buffer. The token
+            capacity may be larger than this call's actual B.
+        recv_buffer: Optional preallocated recv staging buffer. Same
+            constraints as send_buffer.
 
     Returns:
         Combined output [B, H/N, D] (head-scattered)
@@ -429,11 +470,34 @@ def dcp_a2a_lse_reduce(
     H_per_rank = H // world_size
     lse_pack_dim = _dcp_a2a_lse_pack_dim(cp_attn_out.dtype)
 
-    send_buffer, recv_buffer = _dcp_a2a_send_recv_buffers(
-        (world_size, B, H_per_rank, D + lse_pack_dim),
-        device=cp_attn_out.device,
-        dtype=cp_attn_out.dtype,
-    )
+    expected_shape = (world_size, B, H_per_rank, D + lse_pack_dim)
+    if send_buffer is not None and recv_buffer is not None:
+        s = tuple(send_buffer.shape)
+        r = tuple(recv_buffer.shape)
+        if not (
+            len(s) == 4
+            and len(r) == 4
+            and s[0] == world_size
+            and r[0] == world_size
+            and s[1] >= B
+            and r[1] >= B
+            and s[2] == H_per_rank
+            and r[2] == H_per_rank
+            and s[3] == D + lse_pack_dim
+            and r[3] == D + lse_pack_dim
+            and s[1] == r[1]
+            and send_buffer.dtype == cp_attn_out.dtype
+            and recv_buffer.dtype == cp_attn_out.dtype
+        ):
+            send_buffer = None
+            recv_buffer = None
+
+    if send_buffer is None or recv_buffer is None:
+        send_buffer, recv_buffer = _dcp_a2a_send_recv_buffers(
+            expected_shape,
+            device=cp_attn_out.device,
+            dtype=cp_attn_out.dtype,
+        )
 
     _dcp_a2a_pack_send(
         cp_attn_out,
@@ -454,5 +518,10 @@ def dcp_a2a_lse_reduce(
     work.wait()
 
     return _dcp_a2a_unpack_combine(
-        recv_buffer, D, lse_pack_dim, return_lse, is_lse_base_on_e
+        recv_buffer,
+        D,
+        lse_pack_dim,
+        return_lse,
+        is_lse_base_on_e,
+        actual_num_tokens=B,
     )

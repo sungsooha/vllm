@@ -8,7 +8,7 @@ from collections import Counter
 from dataclasses import dataclass, fields, replace
 from enum import Enum, IntEnum
 from math import prod
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal, TypeAlias
 
 import torch
 from typing_extensions import Self
@@ -23,6 +23,8 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
 logger = init_logger(__name__)
+
+KVCacheDCPPolicy: TypeAlias = Literal["sharded", "transparent", "unsupported"]
 
 
 # ---------------------------------------------------------------------------
@@ -537,9 +539,26 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
     alignment: int | None = None  # Default to None for no padding.
     compress_ratio: int = 1
     model_version: str | None = None
+    # Some DeepSeekV4 MLA-adjacent caches, such as compressor states, use the
+    # MLA sliding-window scheduler semantics but not the fp8 MLA KV byte layout.
+    dcp_shardable: bool = False
+    # Some auxiliary state caches must be visible on every DCP rank even when
+    # real KV caches are sharded. They use context-parallel metadata but keep
+    # the regular non-DCP block table / slot mapping semantics.
+    dcp_transparent: bool = False
 
     def __post_init__(self):
         _apply_alignment_padding(self)
+
+    @property
+    def is_deepseek_v4_cache_format(self) -> bool:
+        return (
+            self.model_version == "deepseek_v4" or self.cache_dtype_str == "fp8_ds_mla"
+        )
+
+    @property
+    def supports_dcp_sharding(self) -> bool:
+        return self.dcp_shardable or self.is_deepseek_v4_cache_format
 
     @property
     def storage_block_size(self) -> int:
@@ -547,12 +566,10 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
 
     @property
     def real_page_size_bytes(self) -> int:
-        if self.model_version == "deepseek_v4" and self.cache_dtype_str == "fp8_ds_mla":
-            # DeepseekV4 FlashMLA: 448B NoPE + 128B RoPE + 8B fp8 scale = 584B
-            # per token. FlashInfer's contiguous bf16/fp8 cache falls through to
-            # the element-size formula below.
+        if self.is_deepseek_v4_cache_format:
+            # DeepseekV4: 448B NoPE + 128B RoPE + 8B fp8 scale = 584B per token.
             return self.storage_block_size * 584
-        assert self.model_version in (None, "deepseek_v4"), (
+        assert self.model_version is None, (
             f"Unsupported model version: {self.model_version}"
         )
         return (
@@ -561,6 +578,34 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
             * self.head_size
             * get_dtype_size(self.dtype)
         )
+
+    def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
+        if self.dcp_transparent:
+            max_model_len = vllm_config.model_config.max_model_len
+            max_num_batched_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+            num_tokens = min(
+                self.sliding_window - 1 + max_num_batched_tokens,
+                max_model_len,
+            )
+            return (cdiv(num_tokens, self.block_size) + 1) * self.page_size_bytes
+
+        if not self.supports_dcp_sharding:
+            return super().max_memory_usage_bytes(vllm_config)
+
+        max_model_len = vllm_config.model_config.max_model_len
+        max_num_batched_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+        num_tokens = min(
+            self.sliding_window - 1 + max_num_batched_tokens,
+            max_model_len,
+        )
+
+        dcp_world_size = vllm_config.parallel_config.decode_context_parallel_size
+        pcp_world_size = vllm_config.parallel_config.prefill_context_parallel_size
+        cp_world_size = dcp_world_size * pcp_world_size
+        if cp_world_size > 1:
+            num_tokens = cdiv(num_tokens, cp_world_size)
+
+        return (cdiv(num_tokens, self.block_size) + 1) * self.page_size_bytes
 
     @classmethod
     def merge(cls, specs: list[Self]) -> Self:
@@ -571,16 +616,22 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
         cache_dtype_str_set = set(spec.cache_dtype_str for spec in specs)
         compress_ratio_set = set(spec.compress_ratio for spec in specs)
         model_version_set = set(spec.model_version for spec in specs)
+        alignment_set = set(spec.alignment for spec in specs)
         sliding_window_set = set(spec.sliding_window for spec in specs)
+        dcp_shardable_set = set(spec.dcp_shardable for spec in specs)
+        dcp_transparent_set = set(spec.dcp_transparent for spec in specs)
         assert (
             len(cache_dtype_str_set) == 1
             and len(compress_ratio_set) == 1
             and len(model_version_set) == 1
+            and len(alignment_set) == 1
             and len(sliding_window_set) == 1
+            and len(dcp_shardable_set) == 1
+            and len(dcp_transparent_set) == 1
         ), (
             "All attention layers in the same KV cache group must use the same "
-            "quantization method, compress ratio, model version and sliding "
-            "window size."
+            "quantization method, compress ratio, model version, alignment, "
+            "sliding window size, and DCP policy."
         )
         return cls(
             block_size=specs[0].block_size,
@@ -590,8 +641,11 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
             page_size_padded=specs[0].page_size_padded,
             sliding_window=sliding_window_set.pop(),
             cache_dtype_str=cache_dtype_str_set.pop(),
+            alignment=alignment_set.pop(),
             compress_ratio=compress_ratio_set.pop(),
             model_version=model_version_set.pop(),
+            dcp_shardable=dcp_shardable_set.pop(),
+            dcp_transparent=dcp_transparent_set.pop(),
         )
 
     def is_uniform_with_collection(
@@ -877,3 +931,87 @@ class KVCacheConfig:
     @property
     def needs_kv_cache_zeroing(self) -> bool:
         return self.has_mamba_layers
+
+
+def get_kv_cache_spec_dcp_policy(spec: KVCacheSpec) -> KVCacheDCPPolicy:
+    if isinstance(spec, UniformTypeKVCacheSpecs):
+        policies = {
+            get_kv_cache_spec_dcp_policy(inner_spec)
+            for inner_spec in spec.kv_cache_specs.values()
+        }
+        if len(policies) == 1:
+            return policies.pop()
+        return "unsupported"
+
+    if isinstance(spec, MambaSpec):
+        return "transparent"
+
+    if isinstance(spec, SlidingWindowMLASpec):
+        if spec.dcp_transparent:
+            return "transparent"
+        return "sharded" if spec.supports_dcp_sharding else "unsupported"
+
+    if isinstance(spec, SlidingWindowSpec):
+        return "unsupported"
+
+    if isinstance(spec, ChunkedLocalAttentionSpec):
+        return "unsupported"
+
+    if isinstance(spec, CrossAttentionSpec):
+        return "unsupported"
+
+    if isinstance(spec, FullAttentionSpec):
+        return "sharded"
+
+    return "unsupported"
+
+
+def get_kv_cache_spec_dcp_world_size(
+    spec: KVCacheSpec,
+    dcp_world_size: int,
+) -> int:
+    if dcp_world_size <= 1:
+        return 1
+
+    policy = get_kv_cache_spec_dcp_policy(spec)
+    if policy == "sharded":
+        return dcp_world_size
+    if policy == "transparent":
+        return 1
+
+    raise ValueError(
+        "Decode context parallelism does not support KV cache spec "
+        f"{type(spec).__name__}."
+    )
+
+
+def get_kv_cache_spec_effective_block_size(
+    spec: KVCacheSpec,
+    dcp_world_size: int,
+    pcp_world_size: int = 1,
+) -> int:
+    return (
+        spec.block_size
+        * get_kv_cache_spec_dcp_world_size(spec, dcp_world_size)
+        * pcp_world_size
+    )
+
+
+def get_kv_cache_spec_total_cp_world_size(
+    spec: KVCacheSpec,
+    dcp_world_size: int,
+    pcp_world_size: int = 1,
+) -> int:
+    return get_kv_cache_spec_dcp_world_size(spec, dcp_world_size) * pcp_world_size
+
+
+def get_kv_cache_spec_total_cp_rank(
+    spec: KVCacheSpec,
+    dcp_world_size: int,
+    dcp_rank: int,
+    pcp_world_size: int = 1,
+    pcp_rank: int = 0,
+) -> int:
+    group_dcp_world_size = get_kv_cache_spec_dcp_world_size(spec, dcp_world_size)
+    group_dcp_rank = dcp_rank if group_dcp_world_size > 1 else 0
+    return pcp_rank * group_dcp_world_size + group_dcp_rank

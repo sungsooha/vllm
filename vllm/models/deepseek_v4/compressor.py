@@ -166,6 +166,7 @@ class CompressorStateCache(torch.nn.Module, AttentionLayerBase):
             dtype=self.dtype,
             sliding_window=self.sliding_window,
             alignment=576 if is_flashmla else None,
+            dcp_transparent=True,
         )
 
     def forward(self): ...

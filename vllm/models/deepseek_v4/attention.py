@@ -60,6 +60,67 @@ from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 
 logger = init_logger(__name__)
 
+_FLASHMLA_SUPPORTED_HEAD_COUNTS = (64, 128)
+
+
+def _get_dcp_padded_head_counts(
+    local_heads: int,
+    dcp_world_size: int,
+) -> tuple[int, int]:
+    global_heads = local_heads * dcp_world_size
+    for padded_global_heads in _FLASHMLA_SUPPORTED_HEAD_COUNTS:
+        if (
+            global_heads <= padded_global_heads
+            and padded_global_heads % dcp_world_size == 0
+        ):
+            padded_local_heads = padded_global_heads // dcp_world_size
+            if local_heads <= padded_local_heads:
+                return padded_local_heads, padded_global_heads
+    raise ValueError(
+        "DeepseekV4 DCP requires gathered attention heads to fit a FlashMLA "
+        f"supported head count {_FLASHMLA_SUPPORTED_HEAD_COUNTS}, got "
+        f"local_heads={local_heads}, dcp_world_size={dcp_world_size}."
+    )
+
+
+def _pad_dcp_replicated_query(
+    q_dcp: torch.Tensor,
+    local_heads: int,
+    dcp_world_size: int,
+) -> torch.Tensor:
+    """Pad each DCP rank's replicated Q head chunk to FlashMLA shape."""
+    padded_local_heads, padded_global_heads = _get_dcp_padded_head_counts(
+        local_heads,
+        dcp_world_size,
+    )
+    expected_heads = local_heads * dcp_world_size
+    assert q_dcp.shape[1] == expected_heads, (
+        f"replicated DCP Q has {q_dcp.shape[1]} heads, expected "
+        f"{expected_heads} ({local_heads} local heads * {dcp_world_size} DCP ranks)"
+    )
+    if padded_local_heads == local_heads:
+        return q_dcp
+
+    q_by_rank = q_dcp.view(q_dcp.shape[0], dcp_world_size, local_heads, q_dcp.shape[2])
+    padded = q_dcp.new_zeros(
+        q_dcp.shape[0],
+        dcp_world_size,
+        padded_local_heads,
+        q_dcp.shape[2],
+    )
+    padded[:, :, :local_heads, :].copy_(q_by_rank)
+    return padded.view(q_dcp.shape[0], padded_global_heads, q_dcp.shape[2])
+
+
+def _apply_attn_sink_with_lse(
+    output: torch.Tensor,
+    global_lse: torch.Tensor,
+    attn_sink: torch.Tensor,
+) -> torch.Tensor:
+    sink = attn_sink[: global_lse.shape[1]].to(global_lse.dtype)
+    sink_scale = torch.sigmoid(global_lse - sink.unsqueeze(0))
+    return output * sink_scale.unsqueeze(-1).to(output.dtype)
+
 
 def _resolve_dsv4_kv_cache_dtype(
     use_flashmla_fp8_layout: bool,
@@ -136,6 +197,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         kv: torch.Tensor,
         positions: torch.Tensor,
         output: torch.Tensor,
+        q_dcp_replicated: torch.Tensor | None = None,
     ) -> None:
         """Platform-specific sparse MLA forward; writes attention into ``output``."""
         raise NotImplementedError
@@ -153,6 +215,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         aux_stream_list: list[torch.cuda.Stream] | None = None,
     ) -> None:
         super().__init__()
+        self.vllm_config = vllm_config
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
         cache_config = vllm_config.cache_config
@@ -208,6 +271,18 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             return_bias=False,
             prefix=f"{prefix}.wq_b",
         )
+        self.dcp_world_size = vllm_config.parallel_config.decode_context_parallel_size
+        self.wq_b_dcp = None
+        if envs.VLLM_DSV4_DCP_Q_REPLICATE and self.dcp_world_size > 1:
+            dcp_heads = self.n_local_heads * self.dcp_world_size
+            self.wq_b_dcp = ReplicatedLinear(
+                self.q_lora_rank,
+                dcp_heads * self.head_dim,
+                bias=False,
+                quant_config=quant_config,
+                return_bias=False,
+                prefix=f"{prefix}.wq_b_dcp",
+            )
 
         self.kv_norm = RMSNorm(self.head_dim, self.eps)
         self.wo_a = ColumnParallelLinear(
@@ -438,6 +513,32 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         forward_context = get_forward_context()
         attn_metadata = forward_context.attn_metadata
 
+        q_dcp_replicated = None
+        if self.wq_b_dcp is not None:
+            q_dcp, _ = self.wq_b_dcp(qr)
+            q_dcp = q_dcp.view(
+                -1,
+                self.n_local_heads * self.dcp_world_size,
+                self.head_dim,
+            )
+            q_dcp_replicated = _pad_dcp_replicated_query(
+                q_dcp,
+                self.n_local_heads,
+                self.dcp_world_size,
+            )
+        qrep_on = q_dcp_replicated is not None
+
+        def _maybe_wq_b() -> torch.Tensor:
+            if qrep_on:
+                return torch.empty(
+                    qr.shape[0],
+                    self.n_local_heads,
+                    self.head_dim,
+                    device=qr.device,
+                    dtype=qr.dtype,
+                )
+            return self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
+
         # wq_b + kv_insert (+ MLA compressor when an indexer is present) ride
         # on the default stream so q stays on its consumer stream (forward_mqa
         # downstream reads q on default). Indexer/compressor go on aux for
@@ -450,7 +551,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             compressor = self.compressor
 
             def wq_b_kv_insert() -> torch.Tensor:
-                q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
+                q = _maybe_wq_b()
                 q = self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
                 return q
 
@@ -484,7 +585,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             compressor = self.compressor
 
             def wq_b_kv_insert() -> torch.Tensor:
-                q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
+                q = _maybe_wq_b()
                 q = self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
                 return q
 
@@ -497,12 +598,20 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             )
         else:
             # SWA-only layer: no compressor, no overlap.
-            q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
+            q = _maybe_wq_b()
             q = self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
+
+        if q_dcp_replicated is not None and isinstance(attn_metadata, dict):
+            q_dcp_replicated = self._fused_qnorm_rope_q_only(
+                q_dcp_replicated,
+                kv,
+                positions,
+                attn_metadata,
+            )
 
         # MLA attention writes into the pre-allocated `out` buffer
         # ([num_tokens, padded_heads, head_dim]).
-        self.forward_mqa(q, kv, positions, out)
+        self.forward_mqa(q, kv, positions, out, q_dcp_replicated=q_dcp_replicated)
 
     def _fused_qnorm_rope_kv_insert(
         self,
@@ -592,6 +701,37 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             block_size,
         )
         return q_fp8
+
+    def _fused_qnorm_rope_q_only(
+        self,
+        q: torch.Tensor,
+        kv: torch.Tensor,
+        positions: torch.Tensor,
+        attn_metadata: dict[str, AttentionMetadata],
+    ) -> torch.Tensor:
+        swa_metadata = cast(
+            "DeepseekSparseSWAMetadata | None",
+            attn_metadata.get(self.swa_cache_layer.prefix),
+        )
+        assert swa_metadata is not None
+
+        swa_kv_cache = self.swa_cache_layer.kv_cache
+        assert positions.dtype == torch.int64
+        if swa_kv_cache.dtype != torch.uint8:
+            raise NotImplementedError("DSV4 DCP Q replication requires fp8_ds_mla KV.")
+
+        swa_kv_cache_2d = swa_kv_cache.view(swa_kv_cache.shape[0], -1)
+        return torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+            q,
+            kv,
+            swa_kv_cache_2d,
+            swa_metadata.slot_mapping[:0],
+            positions,
+            self.rotary_emb.cos_sin_cache,
+            q.shape[1],
+            self.eps,
+            swa_metadata.block_size,
+        )
 
     def get_attn_backend(self) -> type[AttentionBackend]:
         return self.backend_cls

@@ -50,7 +50,12 @@ from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
-from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
+from vllm.v1.kv_cache_interface import (
+    KVCacheConfig,
+    MambaSpec,
+    get_kv_cache_spec_total_cp_rank,
+    get_kv_cache_spec_total_cp_world_size,
+)
 from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
 from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
 from vllm.v1.worker.gpu.async_utils import AsyncOutput, AsyncPoolingOutput
@@ -405,16 +410,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
 
         block_sizes = []
+        cp_sizes = []
+        cp_ranks = []
         max_num_blocks_per_group = []
         for kv_cache_group in kv_cache_config.kv_cache_groups:
             spec = kv_cache_group.kv_cache_spec
             block_sizes.append(spec.block_size)
+            cp_size = get_kv_cache_spec_total_cp_world_size(spec, self.dcp_size)
+            cp_rank = get_kv_cache_spec_total_cp_rank(
+                spec,
+                self.dcp_size,
+                self.dcp_rank,
+            )
+            cp_sizes.append(cp_size)
+            cp_ranks.append(cp_rank)
             # When using DCP, each request's KV cache is sharded among different ranks.
             # As a result, one block on the current rank covers `block_size * cp_size`
             # tokens in the full, global (unsharded) sequence.
-            max_num_blocks = cdiv(
-                block_table_max_model_len, spec.block_size * self.dcp_size
-            )
+            max_num_blocks = cdiv(block_table_max_model_len, spec.block_size * cp_size)
             # Align to a multiple of (128 / block_size) as required by some attention
             # backends such as TRTLLM (#39324)
             if spec.block_size <= 128:
@@ -440,6 +453,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             cp_size=self.dcp_size,
             cp_rank=self.dcp_rank,
             cp_interleave=self.cp_interleave,
+            cp_sizes=cp_sizes,
+            cp_ranks=cp_ranks,
         )
         initialize_mamba_ssu_backend(
             self.vllm_config.mamba_config, self.kv_cache_config

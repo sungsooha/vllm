@@ -136,7 +136,10 @@ class DeepseekV4FlashInferMLAAttention(DeepseekV4Attention):
         kv: torch.Tensor,
         positions: torch.Tensor,
         output: torch.Tensor,
+        q_dcp_replicated: torch.Tensor | None = None,
     ) -> None:
+        if q_dcp_replicated is not None:
+            raise NotImplementedError("DSV4 Q replication is only wired for FlashMLA.")
         # The TRTLLM-gen kernel requires h_q in {64, 128}, so the output buffer
         # is allocated at the padded head count while q arrives at the local
         # head count; _forward pads q to match before the launcher.

@@ -483,6 +483,9 @@ def combine_topk_swa_indices(
     topk: int,
     M: int,
     N: int,
+    total_cp_world_size: int = 1,
+    total_cp_rank: int = 0,
+    cp_kv_cache_interleave_size: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     num_tokens = topk_indices.shape[0]
     num_reqs = seq_lens.shape[0]
@@ -516,9 +519,33 @@ def combine_topk_swa_indices(
         TOP_K=topk,
         COMPRESS_RATIO=compress_ratio,
         WINDOW_SIZE=window_size,
+        TOTAL_CP_WORLD_SIZE=total_cp_world_size,
+        TOTAL_CP_RANK=total_cp_rank,
+        CP_KV_CACHE_INTERLEAVE_SIZE=cp_kv_cache_interleave_size,
         PADDED_TOP_K=triton.next_power_of_2(topk_indices.shape[-1]),
     )
     return combined_indices, combined_lens
+
+
+@triton.jit
+def _cp_local_token_count(
+    length,
+    TOTAL_CP_WORLD_SIZE: tl.constexpr,
+    TOTAL_CP_RANK: tl.constexpr,
+    CP_KV_CACHE_INTERLEAVE_SIZE: tl.constexpr,
+):
+    base = (
+        length
+        // CP_KV_CACHE_INTERLEAVE_SIZE
+        // TOTAL_CP_WORLD_SIZE
+        * CP_KV_CACHE_INTERLEAVE_SIZE
+    )
+    remainder = length - base * TOTAL_CP_WORLD_SIZE
+    extra = tl.minimum(
+        tl.maximum(remainder - TOTAL_CP_RANK * CP_KV_CACHE_INTERLEAVE_SIZE, 0),
+        CP_KV_CACHE_INTERLEAVE_SIZE,
+    )
+    return base + extra
 
 
 @triton.jit
@@ -536,6 +563,9 @@ def _combine_topk_swa_indices_kernel(
     TOP_K: tl.constexpr,
     COMPRESS_RATIO: tl.constexpr,
     WINDOW_SIZE: tl.constexpr,
+    TOTAL_CP_WORLD_SIZE: tl.constexpr,
+    TOTAL_CP_RANK: tl.constexpr,
+    CP_KV_CACHE_INTERLEAVE_SIZE: tl.constexpr,
     PADDED_TOP_K: tl.constexpr,
 ):
     batch_idx = tl.program_id(0)
@@ -549,21 +579,33 @@ def _combine_topk_swa_indices_kernel(
     query_end = tl.load(query_start_loc_ptr + batch_idx + 1) - base
     query_len = query_end - query_start
     seq_len = tl.load(seq_lens_ptr + batch_idx)
-    gather_len = tl.load(gather_lens_ptr + batch_idx)
     start_pos = seq_len - query_len
-    # The SWA portion of the gathered buffer starts from position
-    # (seq_len - gather_len), not position 0. We need this offset
-    # to correctly index into the gathered buffer.
-    gather_start = seq_len - gather_len
+    # The SWA gather length is already DCP-local. Recompute the global gather
+    # start from the full request shape, then convert it to the local gather
+    # offset.
+    prefix_len = seq_len - query_len
+    global_gather_len = query_len + tl.minimum(prefix_len, WINDOW_SIZE - 1)
+    global_gather_start = seq_len - global_gather_len
+    local_gather_start = _cp_local_token_count(
+        global_gather_start,
+        TOTAL_CP_WORLD_SIZE,
+        TOTAL_CP_RANK,
+        CP_KV_CACHE_INTERLEAVE_SIZE,
+    )
 
     for token_idx in range(query_start + worker_id, query_end, num_workers):
-        # topk_len is fully determined by the query token's absolute position:
-        # both the C4A indexer and the C128A metadata builder emit
-        # min((pos + 1) // compress_ratio, topk_tokens) valid entries.
+        # topk_len is determined by the query token's absolute position and
+        # this rank's DCP-local compressed-cache coverage.
         # Caller passes TOP_K=0 for SWA-only layers to zero this out.
         token_idx_in_query = token_idx - query_start
         pos = start_pos + token_idx_in_query
-        topk_len = tl.minimum((pos + 1) // COMPRESS_RATIO, TOP_K)
+        local_compressed_len = _cp_local_token_count(
+            (pos + 1) // COMPRESS_RATIO,
+            TOTAL_CP_WORLD_SIZE,
+            TOTAL_CP_RANK,
+            CP_KV_CACHE_INTERLEAVE_SIZE,
+        )
+        topk_len = tl.minimum(local_compressed_len, TOP_K)
         swa_len = tl.minimum(pos + 1, WINDOW_SIZE)
 
         offset = tl.arange(0, PADDED_TOP_K)
@@ -578,19 +620,35 @@ def _combine_topk_swa_indices_kernel(
             mask=mask,
         )
         offset = tl.arange(0, WINDOW_SIZE)
-        # Index into gathered buffer: N + (position - gather_start)
-        # For positions [pos - swa_len + 1, pos], the buffer indices are:
-        # [N + pos - swa_len + 1 - gather_start, N + pos - gather_start]
+        global_swa_pos = offset + pos - swa_len + 1
+        virtual_block_offsets = global_swa_pos % (
+            TOTAL_CP_WORLD_SIZE * CP_KV_CACHE_INTERLEAVE_SIZE
+        )
+        is_local = (
+            virtual_block_offsets // CP_KV_CACHE_INTERLEAVE_SIZE
+        ) == TOTAL_CP_RANK
+        is_local = is_local & (offset < swa_len)
+        local_swa_pos = (
+            _cp_local_token_count(
+                global_swa_pos + 1,
+                TOTAL_CP_WORLD_SIZE,
+                TOTAL_CP_RANK,
+                CP_KV_CACHE_INTERLEAVE_SIZE,
+            )
+            - 1
+        )
+        packed_offsets = tl.cumsum(is_local.to(tl.int32), 0) - 1
         tl.store(
             combined_indices_ptr
             + token_idx * combined_indices_stride
             + topk_len
-            + offset,
-            M * batch_idx + N + offset + pos - swa_len + 1 - gather_start,
-            mask=offset < swa_len,
+            + packed_offsets,
+            M * batch_idx + N + local_swa_pos - local_gather_start,
+            mask=is_local,
         )
 
-        combined_len = topk_len + swa_len
+        local_swa_len = tl.sum(is_local.to(tl.int32), axis=0)
+        combined_len = topk_len + local_swa_len
         tl.store(combined_lens_ptr + token_idx, combined_len)
 
 

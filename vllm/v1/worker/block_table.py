@@ -26,6 +26,8 @@ class BlockTable:
         device: torch.device,
         kernel_block_size: int,
         cp_kv_cache_interleave_size: int,
+        total_cp_world_size: int | None = None,
+        total_cp_rank: int | None = None,
     ):
         """
         Args:
@@ -83,20 +85,32 @@ class BlockTable:
         else:
             self._kernel_block_arange = None
 
-        try:
-            self.pcp_world_size = get_pcp_group().world_size
-            self.pcp_rank = get_pcp_group().rank_in_group
-        except AssertionError:
-            # PCP might not be initialized in testing
-            self.pcp_world_size = 1
-            self.pcp_rank = 0
-        try:
-            self.dcp_world_size = get_dcp_group().world_size
-            self.dcp_rank = get_dcp_group().rank_in_group
-        except AssertionError:
-            # DCP might not be initialized in testing
-            self.dcp_world_size = 1
-            self.dcp_rank = 0
+        if total_cp_world_size is None or total_cp_rank is None:
+            try:
+                pcp_world_size = get_pcp_group().world_size
+                pcp_rank = get_pcp_group().rank_in_group
+            except AssertionError:
+                # PCP might not be initialized in testing
+                pcp_world_size = 1
+                pcp_rank = 0
+            try:
+                dcp_world_size = get_dcp_group().world_size
+                dcp_rank = get_dcp_group().rank_in_group
+            except AssertionError:
+                # DCP might not be initialized in testing
+                dcp_world_size = 1
+                dcp_rank = 0
+            if total_cp_world_size is None:
+                total_cp_world_size = pcp_world_size * dcp_world_size
+            if total_cp_rank is None:
+                if total_cp_world_size == 1:
+                    total_cp_rank = 0
+                elif total_cp_world_size == pcp_world_size:
+                    total_cp_rank = pcp_rank
+                else:
+                    total_cp_rank = pcp_rank * dcp_world_size + dcp_rank
+        self.total_cp_world_size = total_cp_world_size
+        self.total_cp_rank = total_cp_rank
         self.cp_kv_cache_interleave_size = cp_kv_cache_interleave_size
 
     def append_row(
@@ -145,8 +159,6 @@ class BlockTable:
         positions: torch.Tensor,
     ) -> None:
         num_tokens = positions.shape[0]
-        total_cp_world_size = self.pcp_world_size * self.dcp_world_size
-        total_cp_rank = self.pcp_rank * self.dcp_world_size + self.dcp_rank
         _compute_slot_mapping_kernel[(num_reqs + 1,)](
             num_tokens,
             self.max_num_batched_tokens,
@@ -156,8 +168,8 @@ class BlockTable:
             self.block_table.gpu.stride(0),
             self.block_size,
             self.slot_mapping.gpu,
-            TOTAL_CP_WORLD_SIZE=total_cp_world_size,
-            TOTAL_CP_RANK=total_cp_rank,
+            TOTAL_CP_WORLD_SIZE=self.total_cp_world_size,
+            TOTAL_CP_RANK=self.total_cp_rank,
             CP_KV_CACHE_INTERLEAVE_SIZE=self.cp_kv_cache_interleave_size,
             PAD_ID=PAD_SLOT_ID,
             BLOCK_SIZE=1024,
@@ -234,6 +246,8 @@ class MultiGroupBlockTable:
         kernel_block_sizes: list[int],
         max_num_blocks: list[int] | None = None,
         cp_kv_cache_interleave_size: int = 1,
+        total_cp_world_sizes: list[int] | None = None,
+        total_cp_ranks: list[int | None] | None = None,
     ) -> None:
         if len(kernel_block_sizes) != len(block_sizes):
             raise ValueError(
@@ -245,10 +259,14 @@ class MultiGroupBlockTable:
             # (max_model_len//dcp_world_size) tokens in kvcache,
             # so the block_size which used for calc max_num_blocks_per_req
             # must be multiplied by dcp_world_size.
-            total_cp_world_size = get_total_cp_world_size()
+            if total_cp_world_sizes is None:
+                total_cp_world_size = get_total_cp_world_size()
+                total_cp_world_sizes = [total_cp_world_size] * len(block_sizes)
             max_num_blocks = [
                 cdiv(max_model_len, block_size * total_cp_world_size)
-                for block_size in block_sizes
+                for block_size, total_cp_world_size in zip(
+                    block_sizes, total_cp_world_sizes
+                )
             ]
 
         if len(max_num_blocks) != len(block_sizes):
@@ -264,6 +282,22 @@ class MultiGroupBlockTable:
             for n, bs in zip(max_num_blocks, block_sizes)
         ]
 
+        if total_cp_world_sizes is None:
+            total_cp_world_size = get_total_cp_world_size()
+            total_cp_world_sizes = [total_cp_world_size] * len(block_sizes)
+        if total_cp_ranks is None:
+            total_cp_ranks = [None] * len(block_sizes)
+        if len(total_cp_world_sizes) != len(block_sizes):
+            raise ValueError(
+                f"total_cp_world_sizes length ({len(total_cp_world_sizes)}) "
+                f"must match block_sizes length ({len(block_sizes)})"
+            )
+        if len(total_cp_ranks) != len(block_sizes):
+            raise ValueError(
+                f"total_cp_ranks length ({len(total_cp_ranks)}) "
+                f"must match block_sizes length ({len(block_sizes)})"
+            )
+
         self.block_tables = [
             BlockTable(
                 block_size,
@@ -274,9 +308,21 @@ class MultiGroupBlockTable:
                 device,
                 kernel_block_size,
                 cp_kv_cache_interleave_size,
+                total_cp_world_size,
+                total_cp_rank,
             )
-            for block_size, kernel_block_size, max_num_blocks_per_req in zip(
-                block_sizes, kernel_block_sizes, max_num_blocks
+            for (
+                block_size,
+                kernel_block_size,
+                max_num_blocks_per_req,
+                total_cp_world_size,
+                total_cp_rank,
+            ) in zip(
+                block_sizes,
+                kernel_block_sizes,
+                max_num_blocks,
+                total_cp_world_sizes,
+                total_cp_ranks,
             )
         ]
 

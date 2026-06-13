@@ -177,6 +177,10 @@ if TYPE_CHECKING:
     VLLM_MOE_USE_DEEP_GEMM: bool = True
     VLLM_USE_DEEP_GEMM_E8M0: bool = True
     VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES: bool = True
+    VLLM_ENABLE_DEEPSEEK_V4_DCP: bool = False
+    VLLM_ENABLE_DEEPSEEK_V4_DCP_PREFIX_CACHE: bool = False
+    VLLM_ENABLE_DEEPSEEK_V4_DCP_CUDAGRAPH: bool = False
+    VLLM_DSV4_DCP_Q_REPLICATE: bool = False
     VLLM_DEEP_GEMM_WARMUP: Literal[
         "skip",
         "full",
@@ -724,6 +728,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Experimental: breakable cudagraph does not rely on torch.compile
     "VLLM_USE_BREAKABLE_CUDAGRAPH": lambda: (
         os.environ.get("VLLM_USE_BREAKABLE_CUDAGRAPH", "0") == "1"
+    ),
+    # Opt-in gates for the DeepSeek V4 DCP Helix path. These stay explicit so
+    # the delivery can pin the validated Track-A regime without changing
+    # default behavior for other DeepSeek V4 runs.
+    "VLLM_ENABLE_DEEPSEEK_V4_DCP": lambda: (
+        os.environ.get("VLLM_ENABLE_DEEPSEEK_V4_DCP", "0").strip().lower()
+        in ("1", "true")
+    ),
+    "VLLM_ENABLE_DEEPSEEK_V4_DCP_PREFIX_CACHE": lambda: (
+        os.environ.get("VLLM_ENABLE_DEEPSEEK_V4_DCP_PREFIX_CACHE", "0").strip().lower()
+        in ("1", "true")
+    ),
+    "VLLM_ENABLE_DEEPSEEK_V4_DCP_CUDAGRAPH": lambda: (
+        os.environ.get("VLLM_ENABLE_DEEPSEEK_V4_DCP_CUDAGRAPH", "0").strip().lower()
+        in ("1", "true")
+    ),
+    "VLLM_DSV4_DCP_Q_REPLICATE": lambda: bool(
+        int(os.getenv("VLLM_DSV4_DCP_Q_REPLICATE", "0"))
     ),
     # Debug pattern matching inside custom passes.
     # Should be set to the fx.Node name (e.g. 'getitem_34' or 'scaled_mm_3').

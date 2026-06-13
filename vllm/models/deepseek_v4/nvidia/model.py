@@ -8,6 +8,7 @@ import regex as re
 import torch
 import torch.nn as nn
 
+import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.distributed import (
     get_ep_group,
@@ -135,6 +136,33 @@ def make_deepseek_v4_expert_params_mapping(
             ("w3", "w3"),
         ]
     ]
+
+
+def _dsv4_dcp_q_group_index(tp_rank: int, dcp_world_size: int) -> int:
+    return tp_rank // dcp_world_size
+
+
+def _load_dsv4_dcp_replicated_column_weight(
+    param: torch.nn.Parameter,
+    loaded_weight: torch.Tensor,
+    group_idx: int,
+) -> None:
+    """Load the contiguous TP rows owned by one DCP group into a replica."""
+    output_dim = getattr(param, "output_dim", None)
+    if len(loaded_weight.shape) == 0:
+        loaded_weight = loaded_weight.reshape(1)
+
+    param_data = param.data
+    if output_dim is not None and loaded_weight.shape != param_data.shape:
+        shard_size = param_data.shape[output_dim]
+        start_idx = group_idx * shard_size
+        loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
+
+    assert param_data.shape == loaded_weight.shape, (
+        f"Tried to load DCP-replicated wq_b weight of size {loaded_weight.shape} "
+        f"into parameter of size {param_data.shape}"
+    )
+    param_data.copy_(loaded_weight)
 
 
 class DeepseekV4MegaMoEExperts(nn.Module):
@@ -906,6 +934,7 @@ class DeepseekV4Model(nn.Module):
         self.hc_mult = config.hc_mult
         self.hc_dim = self.hc_mult * config.hidden_size
         self.rms_norm_eps = config.rms_norm_eps
+        self.dcp_world_size = vllm_config.parallel_config.decode_context_parallel_size
 
         # Three aux streams: one per non-default input GEMM in
         # DeepseekV4Attention.attn_gemm_parallel_execute
@@ -1076,6 +1105,8 @@ class DeepseekV4Model(nn.Module):
         n_local_head = n_head // tp_size
         head_rank_start = n_local_head * tp_rank
         head_rank_end = n_local_head * (tp_rank + 1)
+        dcp_world_size = self.dcp_world_size
+        dcp_q_group_idx = _dsv4_dcp_q_group_index(tp_rank, dcp_world_size)
 
         # Pre-compute expert mapping ONCE.
         expert_mapping = self.get_expert_mapping()
@@ -1151,6 +1182,19 @@ class DeepseekV4Model(nn.Module):
                     )
                     weight_loader(param, loaded_weight)
                     loaded_params.add(name)
+                    if (
+                        envs.VLLM_DSV4_DCP_Q_REPLICATE
+                        and dcp_world_size > 1
+                        and ".attn.wq_b." in name
+                    ):
+                        dcp_name = name.replace(".attn.wq_b.", ".attn.wq_b_dcp.")
+                        if dcp_name in params_dict:
+                            _load_dsv4_dcp_replicated_column_weight(
+                                params_dict[dcp_name],
+                                loaded_weight,
+                                dcp_q_group_idx,
+                            )
+                            loaded_params.add(dcp_name)
                     continue
 
         return loaded_params
