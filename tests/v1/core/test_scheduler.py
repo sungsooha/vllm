@@ -6030,3 +6030,97 @@ def test_encoder_input_skipped_when_connector_already_has_the_item(ec_role: str)
 
     assert output.num_scheduled_tokens[req_id] > 0
     assert not output.scheduled_encoder_inputs.get(req_id)
+
+
+def _mamba_spec_scheduler(num_spec: int, block_size: int, num_prompt_tokens: int):
+    """A hybrid-Mamba scheduler with spec decode and an async KV connector."""
+    from vllm.v1.kv_cache_interface import MambaSpec
+
+    return create_scheduler(
+        num_speculative_tokens=num_spec,
+        enable_prefix_caching=False,
+        block_size=block_size,
+        use_kv_connector=mock_kv(matched_tokens=num_prompt_tokens, is_async=True),
+        kv_cache_spec=MambaSpec(
+            block_size=block_size,
+            shapes=((1, 1),),
+            dtypes=(torch.float32,),
+            mamba_cache_mode="all",
+        ),
+    )
+
+
+def _drive_to_remote_kv_handoff(scheduler, num_prompt_tokens: int, block_size: int):
+    """r1 decodes (the co-batched neighbour); r2 completes its remote-KV load."""
+    from tests.v1.kv_connector.unit.utils import create_model_runner_output
+
+    r1, r2 = create_requests(
+        num_requests=2,
+        num_tokens=num_prompt_tokens,
+        max_tokens=20,
+        block_size=block_size,
+        req_ids=["r1", "r2"],
+    )
+    scheduler.add_request(r1)
+    _step_until_kv_transfer_finished(scheduler, ["r1"])
+    output = scheduler.schedule()
+    scheduler.update_from_output(
+        output, create_model_runner_output([r1], token_id=1000)
+    )
+    assert scheduler.running, "r1 must be decoding so the step is co-batched"
+
+    scheduler.add_request(r2)
+    output = scheduler.schedule()
+    assert r2.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    scheduler.update_from_output(
+        output, create_model_runner_output([r1], finished_recving={"r2"})
+    )
+    return r1, r2
+
+
+@pytest.mark.cpu_test
+def test_remote_kv_handoff_step_is_not_spec_padded():
+    """The first decode step after a remote-KV handoff must stay UNPADDED.
+
+    A hybrid-Mamba decoder recomputes the final prompt token after the handoff,
+    so that step has exactly one real query. Padding it with placeholder drafts
+    makes it look like a uniform decode batch, which gets replayed through the
+    captured FULL decode graph where the placeholder slots read co-batched
+    neighbours' state.
+    """
+    num_spec, block_size, num_prompt_tokens = 3, 16, 33
+    scheduler = _mamba_spec_scheduler(num_spec, block_size, num_prompt_tokens)
+    _r1, r2 = _drive_to_remote_kv_handoff(scheduler, num_prompt_tokens, block_size)
+
+    output = scheduler.schedule()
+
+    # The handoff was detected per request, not from the instance-level kv_role.
+    assert r2.received_remote_kv is True
+    assert r2.num_output_tokens == 0
+    assert r2.num_computed_tokens == r2.num_prompt_tokens - 1
+    # One real query, and no placeholder drafts.
+    assert output.num_scheduled_tokens["r2"] == 1
+    assert "r2" not in output.scheduled_spec_decode_tokens
+
+
+@pytest.mark.cpu_test
+def test_non_handoff_one_token_step_is_still_spec_padded():
+    """The gate is scoped: an identically-shaped step that did NOT come from a
+    remote-KV handoff keeps the uniform-shape padding.
+
+    This is the discrimination the instance-level role signal cannot express --
+    `kv_both` is a member of both KVProducer and KVConsumer, so `is_kv_consumer`
+    is True even on a prefill instance and `kv_role == "kv_consumer"` is False
+    even on a decode one.
+    """
+    num_spec, block_size, num_prompt_tokens = 3, 16, 33
+    scheduler = _mamba_spec_scheduler(num_spec, block_size, num_prompt_tokens)
+    _r1, r2 = _drive_to_remote_kv_handoff(scheduler, num_prompt_tokens, block_size)
+
+    # Same cursor/shape, but not flagged as a remote-KV handoff.
+    r2.received_remote_kv = False
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens["r2"] == 1 + num_spec
+    assert output.scheduled_spec_decode_tokens["r2"] == [-1] * num_spec
