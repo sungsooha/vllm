@@ -6175,16 +6175,27 @@ def test_mamba_spec_padding_kept_without_remote_kv_handoff():
     r1, r2 = create_requests(
         num_requests=2, num_tokens=33, same_prompt=True, max_tokens=16
     )
+    # Mamba's block-aligned split chunks the prompt at the last cacheable block
+    # boundary, so the prefill takes more than one step -- drive it to the end
+    # rather than assuming a single 33-token step.
     scheduler.add_request(r1)
-    out = scheduler.schedule()
-    assert out.num_scheduled_tokens[r1.request_id] == 33
-    _model_output(scheduler, out, [[100]])
+    while True:
+        out = scheduler.schedule()
+        last = (
+            r1.num_computed_tokens + out.num_scheduled_tokens[r1.request_id]
+            >= r1.num_prompt_tokens
+        )
+        _model_output(scheduler, out, [[100]] if last else [[]])
+        if last:
+            break
     scheduler.update_draft_token_ids(DraftTokenIds([r1.request_id], [[1, 2, 3]]))
 
     scheduler.add_request(r2)
     out = scheduler.schedule()
 
-    assert r2.received_remote_kv is False
+    # getattr, not attribute access: this control must also run against an
+    # engine that does not have the marker at all.
+    assert getattr(r2, "received_remote_kv", False) is False
     assert r2.num_output_tokens == 0
     assert r2.num_computed_tokens == r2.num_prompt_tokens - 1
     assert out.scheduled_spec_decode_tokens[r1.request_id] == [1, 2, 3]
