@@ -6055,16 +6055,18 @@ def _mamba_handoff_scheduler(
 
 
 @pytest.mark.parametrize(
-    ("kv_role", "mamba_cache_mode"),
+    ("kv_role", "mamba_cache_mode", "num_preemptions"),
     [
-        pytest.param("kv_consumer", "all", id="consumer-all"),
-        pytest.param("kv_both", "all", id="both-all"),
-        pytest.param("kv_both", "align", id="both-align"),
+        pytest.param("kv_consumer", "all", 0, id="consumer-all"),
+        pytest.param("kv_both", "all", 0, id="both-all"),
+        pytest.param("kv_both", "align", 0, id="both-align"),
+        pytest.param("kv_both", "align", 1, id="both-align-preempted"),
     ],
 )
 def test_mamba_remote_kv_handoff_skips_spec_padding(
     kv_role: str,
     mamba_cache_mode: str,
+    num_preemptions: int,
     monkeypatch: pytest.MonkeyPatch,
 ):
     """A remote-KV handoff step skips speculative padding for ANY kv_role.
@@ -6082,6 +6084,12 @@ def test_mamba_remote_kv_handoff_skips_spec_padding(
     configures "kv_both" on both roles is therefore indistinguishable from an
     aggregated one by role alone -- so the handoff must be detected per request,
     and every case here expects the same unpadded step.
+
+    num_preemptions > 0 makes promotion leave the request PREEMPTED rather than
+    WAITING. That is a true handoff too -- a request can be preempted, put back
+    into a fresh async remote-KV load, and promoted when that load finishes -- so
+    it must also skip the padding. It does, because the predicate keys on the
+    per-request marker and not on the request status.
     """
     from tests.v1.kv_connector.unit.utils import create_model_runner_output
 
@@ -6123,6 +6131,7 @@ def test_mamba_remote_kv_handoff_skips_spec_padding(
             post_handoff_computed_tokens.append(request.num_computed_tokens)
 
     monkeypatch.setattr(scheduler, "_update_waiting_for_remote_kv", capture_handoff)
+    r2.num_preemptions = num_preemptions
     out = scheduler.schedule()
 
     # The cursor was rewound by exactly one token, which is what makes the step
