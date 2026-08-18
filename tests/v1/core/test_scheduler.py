@@ -6197,7 +6197,9 @@ def test_mamba_spec_padding_kept_without_remote_kv_handoff():
     # engine that does not have the marker at all.
     assert getattr(r2, "received_remote_kv", False) is False
     assert r2.num_output_tokens == 0
-    assert r2.num_computed_tokens == r2.num_prompt_tokens - 1
+    # NB: assert on the scheduler OUTPUT, not on request.num_computed_tokens --
+    # schedule() advances that optimistically before returning, so post-call it
+    # already reads num_prompt_tokens - 1 + the padded span.
     assert out.scheduled_spec_decode_tokens[r1.request_id] == [1, 2, 3]
     # Still padded: no remote-KV handoff, so the gate must not fire.
     assert out.num_scheduled_tokens[r2.request_id] == 1 + num_spec
