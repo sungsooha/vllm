@@ -575,6 +575,22 @@ class Scheduler(SchedulerInterface):
                 - self.num_sampled_tokens_per_step,
             )
 
+            # num_computed_tokens >= max_model_len (reachable via the optimistic
+            # spec-token advance under async scheduling on a disagg decode
+            # worker) makes the cap above negative. Clamp here, at the source,
+            # so every consumer below keeps the num_new_tokens >= 0 assumption
+            # it already encodes: the "reached max_model_len" path is selected
+            # by `num_new_tokens == 0` (not `<= 0`) both here and in
+            # _try_schedule_encoder_inputs, and a negative would instead reach
+            # the model runner as a negative num_scheduled_tokens and crash
+            # np.repeat(arange, -N).
+            #
+            # Two clamps further down (_mamba_block_aligned_split and
+            # _reserve_prefill_lookahead) happen to absorb the negative today,
+            # but both exist for unrelated reasons and the first is conditional
+            # on the model being hybrid-Mamba, so neither is a guarantee.
+            num_new_tokens = max(num_new_tokens, 0)
+
             # Apply Mamba alignment before encoder caps.
             if self.need_mamba_block_aligned_split:
                 num_new_tokens = self._mamba_block_aligned_split(
